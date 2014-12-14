@@ -1,7 +1,6 @@
-#!/bin/sh
-
 mkdir -p build/
 cp jsPlumb/src/*.js build/
+cp jsPlumb/lib/*.js build/
 
 cd build
 
@@ -32,11 +31,17 @@ replace -m '^.*AMD(.|\n)*AMD.*-\s+$' 'global.jsPlumb = new global.jsPlumbInstanc
 replace 'global\.OverlayCapableJsPlumbUIComponent = global\.OverlayCapableJsPlumbUIComponent' 'OverlayCapableJsPlumbUIComponent = global.OverlayCapableJsPlumbUIComponent'
 
 cat \
+  jsBezier-0.6.js biltong*.js \
+  mottle*.js katavorio*.js \
   util.js browser-util.js \
   dom-adapter.js jsPlumb.js \
   endpoint.js connection.js \
   anchors.js defaults.js \
   base-library-adapter.js \
+  connectors-flowchart.js \
+  connectors-statemachine.js \
+  connectors-bezier.js \
+  renderers-svg.js \
   > ../index.js
 
 cd ../

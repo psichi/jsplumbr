@@ -4,7 +4,8 @@
   "description": "require JSPlumb",
   "main": "index.js",
   "scripts": {
-    "build": "./build.sh"
+    "build": "./build.sh && npm run beautify",
+    "beautify": "./node_modules/js-beautify/js/bin/js-beautify.js -r -f index.js -j --good-stuff"
   },
   "author": "",
   "license": "ISC",

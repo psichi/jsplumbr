@@ -1,3 +1,2028 @@
+/**
+ * jsBezier-0.6
+ *
+ * Copyright (c) 2010 - 2013 Simon Porritt (simon.porritt@gmail.com)
+ *
+ * licensed under the MIT license.
+ *
+ * a set of Bezier curve functions that deal with Beziers, used by jsPlumb, and perhaps useful for other people.  These functions work with Bezier
+ * curves of arbitrary degree.
+ *
+ * - functions are all in the 'jsBezier' namespace.
+ *
+ * - all input points should be in the format {x:.., y:..}. all output points are in this format too.
+ *
+ * - all input curves should be in the format [ {x:.., y:..}, {x:.., y:..}, {x:.., y:..}, {x:.., y:..} ]
+ *
+ * - 'location' as used as an input here refers to a decimal in the range 0-1 inclusive, which indicates a point some proportion along the length
+ * of the curve.  location as output has the same format and meaning.
+ *
+ *
+ * Function List:
+ * --------------
+ *
+ * distanceFromCurve(point, curve)
+ *
+ * 	Calculates the distance that the given point lies from the given Bezier.  Note that it is computed relative to the center of the Bezier,
+ * so if you have stroked the curve with a wide pen you may wish to take that into account!  The distance returned is relative to the values
+ * of the curve and the point - it will most likely be pixels.
+ *
+ * gradientAtPoint(curve, location)
+ *
+ * 	Calculates the gradient to the curve at the given location, as a decimal between 0 and 1 inclusive.
+ *
+ * gradientAtPointAlongCurveFrom (curve, location)
+ *
+ *	Calculates the gradient at the point on the given curve that is 'distance' units from location.
+ *
+ * nearestPointOnCurve(point, curve)
+ *
+ *	Calculates the nearest point to the given point on the given curve.  The return value of this is a JS object literal, containing both the
+ *point's coordinates and also the 'location' of the point (see above), for example:  { point:{x:551,y:150}, location:0.263365 }.
+ *
+ * pointOnCurve(curve, location)
+ *
+ * 	Calculates the coordinates of the point on the given Bezier curve at the given location.
+ *
+ * pointAlongCurveFrom(curve, location, distance)
+ *
+ * 	Calculates the coordinates of the point on the given curve that is 'distance' units from location.  'distance' should be in the same coordinate
+ * space as that used to construct the Bezier curve.  For an HTML Canvas usage, for example, distance would be a measure of pixels.
+ *
+ * locationAlongCurveFrom(curve, location, distance)
+ *
+ * 	Calculates the location on the given curve that is 'distance' units from location.  'distance' should be in the same coordinate
+ * space as that used to construct the Bezier curve.  For an HTML Canvas usage, for example, distance would be a measure of pixels.
+ *
+ * perpendicularToCurveAt(curve, location, length, distance)
+ *
+ * 	Calculates the perpendicular to the given curve at the given location.  length is the length of the line you wish for (it will be centered
+ * on the point at 'location'). distance is optional, and allows you to specify a point along the path from the given location as the center of
+ * the perpendicular returned.  The return value of this is an array of two points: [ {x:...,y:...}, {x:...,y:...} ].
+ *
+ *
+ */
+
+(function () {
+
+    if (typeof Math.sgn == "undefined") {
+        Math.sgn = function (x) {
+            return x == 0 ? 0 : x > 0 ? 1 : -1;
+        };
+    }
+
+    var Vectors = {
+            subtract: function (v1, v2) {
+                return {
+                    x: v1.x - v2.x,
+                    y: v1.y - v2.y
+                };
+            },
+            dotProduct: function (v1, v2) {
+                return (v1.x * v2.x) + (v1.y * v2.y);
+            },
+            square: function (v) {
+                return Math.sqrt((v.x * v.x) + (v.y * v.y));
+            },
+            scale: function (v, s) {
+                return {
+                    x: v.x * s,
+                    y: v.y * s
+                };
+            }
+        },
+
+        maxRecursion = 64,
+        flatnessTolerance = Math.pow(2.0, -maxRecursion - 1);
+
+    /**
+     * Calculates the distance that the point lies from the curve.
+     *
+     * @param point a point in the form {x:567, y:3342}
+     * @param curve a Bezier curve in the form [{x:..., y:...}, {x:..., y:...}, {x:..., y:...}, {x:..., y:...}].  note that this is currently
+     * hardcoded to assume cubiz beziers, but would be better off supporting any degree.
+     * @return a JS object literal containing location and distance, for example: {location:0.35, distance:10}.  Location is analogous to the location
+     * argument you pass to the pointOnPath function: it is a ratio of distance travelled along the curve.  Distance is the distance in pixels from
+     * the point to the curve.
+     */
+    var _distanceFromCurve = function (point, curve) {
+        var candidates = [],
+            w = _convertToBezier(point, curve),
+            degree = curve.length - 1,
+            higherDegree = (2 * degree) - 1,
+            numSolutions = _findRoots(w, higherDegree, candidates, 0),
+            v = Vectors.subtract(point, curve[0]),
+            dist = Vectors.square(v),
+            t = 0.0;
+
+        for (var i = 0; i < numSolutions; i++) {
+            v = Vectors.subtract(point, _bezier(curve, degree, candidates[i], null, null));
+            var newDist = Vectors.square(v);
+            if (newDist < dist) {
+                dist = newDist;
+                t = candidates[i];
+            }
+        }
+        v = Vectors.subtract(point, curve[degree]);
+        newDist = Vectors.square(v);
+        if (newDist < dist) {
+            dist = newDist;
+            t = 1.0;
+        }
+        return {
+            location: t,
+            distance: dist
+        };
+    };
+    /**
+     * finds the nearest point on the curve to the given point.
+     */
+    var _nearestPointOnCurve = function (point, curve) {
+        var td = _distanceFromCurve(point, curve);
+        return {
+            point: _bezier(curve, curve.length - 1, td.location, null, null),
+            location: td.location
+        };
+    };
+    var _convertToBezier = function (point, curve) {
+        var degree = curve.length - 1,
+            higherDegree = (2 * degree) - 1,
+            c = [],
+            d = [],
+            cdTable = [],
+            w = [],
+            z = [[1.0, 0.6, 0.3, 0.1], [0.4, 0.6, 0.6, 0.4], [0.1, 0.3, 0.6, 1.0]];
+
+        for (var i = 0; i <= degree; i++) c[i] = Vectors.subtract(curve[i], point);
+        for (var i = 0; i <= degree - 1; i++) {
+            d[i] = Vectors.subtract(curve[i + 1], curve[i]);
+            d[i] = Vectors.scale(d[i], 3.0);
+        }
+        for (var row = 0; row <= degree - 1; row++) {
+            for (var column = 0; column <= degree; column++) {
+                if (!cdTable[row]) cdTable[row] = [];
+                cdTable[row][column] = Vectors.dotProduct(d[row], c[column]);
+            }
+        }
+        for (i = 0; i <= higherDegree; i++) {
+            if (!w[i]) w[i] = [];
+            w[i].y = 0.0;
+            w[i].x = parseFloat(i) / higherDegree;
+        }
+        var n = degree,
+            m = degree - 1;
+        for (var k = 0; k <= n + m; k++) {
+            var lb = Math.max(0, k - m),
+                ub = Math.min(k, n);
+            for (i = lb; i <= ub; i++) {
+                j = k - i;
+                w[i + j].y += cdTable[j][i] * z[j][i];
+            }
+        }
+        return w;
+    };
+    /**
+     * counts how many roots there are.
+     */
+    var _findRoots = function (w, degree, t, depth) {
+        var left = [],
+            right = [],
+            left_count, right_count,
+            left_t = [],
+            right_t = [];
+
+        switch (_getCrossingCount(w, degree)) {
+        case 0:
+            {
+                return 0;
+            }
+        case 1:
+            {
+                if (depth >= maxRecursion) {
+                    t[0] = (w[0].x + w[degree].x) / 2.0;
+                    return 1;
+                }
+                if (_isFlatEnough(w, degree)) {
+                    t[0] = _computeXIntercept(w, degree);
+                    return 1;
+                }
+                break;
+            }
+        }
+        _bezier(w, degree, 0.5, left, right);
+        left_count = _findRoots(left, degree, left_t, depth + 1);
+        right_count = _findRoots(right, degree, right_t, depth + 1);
+        for (var i = 0; i < left_count; i++) t[i] = left_t[i];
+        for (var i = 0; i < right_count; i++) t[i + left_count] = right_t[i];
+        return (left_count + right_count);
+    };
+    var _getCrossingCount = function (curve, degree) {
+        var n_crossings = 0,
+            sign, old_sign;
+        sign = old_sign = Math.sgn(curve[0].y);
+        for (var i = 1; i <= degree; i++) {
+            sign = Math.sgn(curve[i].y);
+            if (sign != old_sign) n_crossings++;
+            old_sign = sign;
+        }
+        return n_crossings;
+    };
+    var _isFlatEnough = function (curve, degree) {
+        var error,
+            intercept_1, intercept_2, left_intercept, right_intercept,
+            a, b, c, det, dInv, a1, b1, c1, a2, b2, c2;
+        a = curve[0].y - curve[degree].y;
+        b = curve[degree].x - curve[0].x;
+        c = curve[0].x * curve[degree].y - curve[degree].x * curve[0].y;
+
+        var max_distance_above = max_distance_below = 0.0;
+
+        for (var i = 1; i < degree; i++) {
+            var value = a * curve[i].x + b * curve[i].y + c;
+            if (value > max_distance_above)
+                max_distance_above = value;
+            else if (value < max_distance_below)
+                max_distance_below = value;
+        }
+
+        a1 = 0.0;
+        b1 = 1.0;
+        c1 = 0.0;
+        a2 = a;
+        b2 = b;
+        c2 = c - max_distance_above;
+        det = a1 * b2 - a2 * b1;
+        dInv = 1.0 / det;
+        intercept_1 = (b1 * c2 - b2 * c1) * dInv;
+        a2 = a;
+        b2 = b;
+        c2 = c - max_distance_below;
+        det = a1 * b2 - a2 * b1;
+        dInv = 1.0 / det;
+        intercept_2 = (b1 * c2 - b2 * c1) * dInv;
+        left_intercept = Math.min(intercept_1, intercept_2);
+        right_intercept = Math.max(intercept_1, intercept_2);
+        error = right_intercept - left_intercept;
+        return (error < flatnessTolerance) ? 1 : 0;
+    };
+    var _computeXIntercept = function (curve, degree) {
+        var XLK = 1.0,
+            YLK = 0.0,
+            XNM = curve[degree].x - curve[0].x,
+            YNM = curve[degree].y - curve[0].y,
+            XMK = curve[0].x - 0.0,
+            YMK = curve[0].y - 0.0,
+            det = XNM * YLK - YNM * XLK,
+            detInv = 1.0 / det,
+            S = (XNM * YMK - YNM * XMK) * detInv;
+        return 0.0 + XLK * S;
+    };
+    var _bezier = function (curve, degree, t, left, right) {
+        var temp = [[]];
+        for (var j = 0; j <= degree; j++) temp[0][j] = curve[j];
+        for (var i = 1; i <= degree; i++) {
+            for (var j = 0; j <= degree - i; j++) {
+                if (!temp[i]) temp[i] = [];
+                if (!temp[i][j]) temp[i][j] = {};
+                temp[i][j].x = (1.0 - t) * temp[i - 1][j].x + t * temp[i - 1][j + 1].x;
+                temp[i][j].y = (1.0 - t) * temp[i - 1][j].y + t * temp[i - 1][j + 1].y;
+            }
+        }
+        if (left !== null)
+            for (j = 0; j <= degree; j++) left[j] = temp[j][0];
+        if (right !== null)
+            for (j = 0; j <= degree; j++) right[j] = temp[degree - j][j];
+
+        return (temp[degree][0]);
+    };
+
+    var _curveFunctionCache = {};
+    var _getCurveFunctions = function (order) {
+        var fns = _curveFunctionCache[order];
+        if (!fns) {
+            fns = [];
+            var f_term = function () {
+                    return function (t) {
+                        return Math.pow(t, order);
+                    };
+                },
+                l_term = function () {
+                    return function (t) {
+                        return Math.pow((1 - t), order);
+                    };
+                },
+                c_term = function (c) {
+                    return function (t) {
+                        return c;
+                    };
+                },
+                t_term = function () {
+                    return function (t) {
+                        return t;
+                    };
+                },
+                one_minus_t_term = function () {
+                    return function (t) {
+                        return 1 - t;
+                    };
+                },
+                _termFunc = function (terms) {
+                    return function (t) {
+                        var p = 1;
+                        for (var i = 0; i < terms.length; i++) p = p * terms[i](t);
+                        return p;
+                    };
+                };
+
+            fns.push(new f_term()); // first is t to the power of the curve order		
+            for (var i = 1; i < order; i++) {
+                var terms = [new c_term(order)];
+                for (var j = 0; j < (order - i); j++) terms.push(new t_term());
+                for (var j = 0; j < i; j++) terms.push(new one_minus_t_term());
+                fns.push(new _termFunc(terms));
+            }
+            fns.push(new l_term()); // last is (1-t) to the power of the curve order
+
+            _curveFunctionCache[order] = fns;
+        }
+
+        return fns;
+    };
+
+
+    /**
+     * calculates a point on the curve, for a Bezier of arbitrary order.
+     * @param curve an array of control points, eg [{x:10,y:20}, {x:50,y:50}, {x:100,y:100}, {x:120,y:100}].  For a cubic bezier this should have four points.
+     * @param location a decimal indicating the distance along the curve the point should be located at.  this is the distance along the curve as it travels, taking the way it bends into account.  should be a number from 0 to 1, inclusive.
+     */
+    var _pointOnPath = function (curve, location) {
+        var cc = _getCurveFunctions(curve.length - 1),
+            _x = 0,
+            _y = 0;
+        for (var i = 0; i < curve.length; i++) {
+            _x = _x + (curve[i].x * cc[i](location));
+            _y = _y + (curve[i].y * cc[i](location));
+        }
+
+        return {
+            x: _x,
+            y: _y
+        };
+    };
+
+    var _dist = function (p1, p2) {
+        return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+    };
+
+    var _isPoint = function (curve) {
+        return curve[0].x == curve[1].x && curve[0].y == curve[1].y;
+    };
+
+    /**
+     * finds the point that is 'distance' along the path from 'location'.  this method returns both the x,y location of the point and also
+     * its 'location' (proportion of travel along the path); the method below - _pointAlongPathFrom - calls this method and just returns the
+     * point.
+     */
+    var _pointAlongPath = function (curve, location, distance) {
+
+        if (_isPoint(curve)) {
+            return {
+                point: curve[0],
+                location: location
+            };
+        }
+
+        var prev = _pointOnPath(curve, location),
+            tally = 0,
+            curLoc = location,
+            direction = distance > 0 ? 1 : -1,
+            cur = null;
+
+        while (tally < Math.abs(distance)) {
+            curLoc += (0.005 * direction);
+            cur = _pointOnPath(curve, curLoc);
+            tally += _dist(cur, prev);
+            prev = cur;
+        }
+        return {
+            point: cur,
+            location: curLoc
+        };
+    };
+
+    var _length = function (curve) {
+        if (_isPoint(curve)) return 0;
+
+        var prev = _pointOnPath(curve, 0),
+            tally = 0,
+            curLoc = 0,
+            direction = 1,
+            cur = null;
+
+        while (curLoc < 1) {
+            curLoc += (0.005 * direction);
+            cur = _pointOnPath(curve, curLoc);
+            tally += _dist(cur, prev);
+            prev = cur;
+        }
+        return tally;
+    };
+
+    /**
+     * finds the point that is 'distance' along the path from 'location'.
+     */
+    var _pointAlongPathFrom = function (curve, location, distance) {
+        return _pointAlongPath(curve, location, distance).point;
+    };
+
+    /**
+     * finds the location that is 'distance' along the path from 'location'.
+     */
+    var _locationAlongPathFrom = function (curve, location, distance) {
+        return _pointAlongPath(curve, location, distance).location;
+    };
+
+    /**
+     * returns the gradient of the curve at the given location, which is a decimal between 0 and 1 inclusive.
+     *
+     * thanks // http://bimixual.org/AnimationLibrary/beziertangents.html
+     */
+    var _gradientAtPoint = function (curve, location) {
+        var p1 = _pointOnPath(curve, location),
+            p2 = _pointOnPath(curve.slice(0, curve.length - 1), location),
+            dy = p2.y - p1.y,
+            dx = p2.x - p1.x;
+        return dy == 0 ? Infinity : Math.atan(dy / dx);
+    };
+
+    /**
+	returns the gradient of the curve at the point which is 'distance' from the given location.
+	if this point is greater than location 1, the gradient at location 1 is returned.
+	if this point is less than location 0, the gradient at location 0 is returned.
+	*/
+    var _gradientAtPointAlongPathFrom = function (curve, location, distance) {
+        var p = _pointAlongPath(curve, location, distance);
+        if (p.location > 1) p.location = 1;
+        if (p.location < 0) p.location = 0;
+        return _gradientAtPoint(curve, p.location);
+    };
+
+    /**
+     * calculates a line that is 'length' pixels long, perpendicular to, and centered on, the path at 'distance' pixels from the given location.
+     * if distance is not supplied, the perpendicular for the given location is computed (ie. we set distance to zero).
+     */
+    var _perpendicularToPathAt = function (curve, location, length, distance) {
+        distance = distance === null ? 0 : distance;
+        var p = _pointAlongPath(curve, location, distance),
+            m = _gradientAtPoint(curve, p.location),
+            _theta2 = Math.atan(-1 / m),
+            y = length / 2 * Math.sin(_theta2),
+            x = length / 2 * Math.cos(_theta2);
+        return [{
+            x: p.point.x + x,
+            y: p.point.y + y
+        }, {
+            x: p.point.x - x,
+            y: p.point.y - y
+        }];
+    };
+
+    var jsBezier = global.jsBezier = {
+        distanceFromCurve: _distanceFromCurve,
+        gradientAtPoint: _gradientAtPoint,
+        gradientAtPointAlongCurveFrom: _gradientAtPointAlongPathFrom,
+        nearestPointOnCurve: _nearestPointOnCurve,
+        pointOnCurve: _pointOnPath,
+        pointAlongCurveFrom: _pointAlongPathFrom,
+        perpendicularToCurveAt: _perpendicularToPathAt,
+        locationAlongCurveFrom: _locationAlongPathFrom,
+        getLength: _length
+    };
+})(typeof exports !== undefined ? exports : this);
+/**
+ * Biltong v0.2
+ *
+ * Various geometry functions written as part of jsPlumb and perhaps useful for others.
+ *
+ * Copyright (c) 2014 Simon Porritt
+ *
+ * Permission is hereby granted, free of charge, to any person
+ * obtaining a copy of this software and associated documentation
+ * files (the "Software"), to deal in the Software without
+ * restriction, including without limitation the rights to use,
+ * copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+ * OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ */
+;
+(function (global) {
+
+
+    "use strict";
+
+    var Biltong = this.Biltong = {};
+
+    var _isa = function (a) {
+            return Object.prototype.toString.call(a) === "[object Array]";
+        },
+        _pointHelper = function (p1, p2, fn) {
+            p1 = _isa(p1) ? p1 : [p1.x, p1.y];
+            p2 = _isa(p2) ? p2 : [p2.x, p2.y];
+            return fn(p1, p2);
+        },
+        /**
+         * @name Biltong.gradient
+         * @function
+         * @desc Calculates the gradient of a line between the two points.
+         * @param {Point} p1 First point, either as a 2 entry array or object with `left` and `top` properties.
+         * @param {Point} p2 Second point, either as a 2 entry array or object with `left` and `top` properties.
+         * @return {Float} The gradient of a line between the two points.
+         */
+        _gradient = Biltong.gradient = function (p1, p2) {
+            return _pointHelper(p1, p2, function (_p1, _p2) {
+                if (_p2[0] == _p1[0])
+                    return _p2[1] > _p1[1] ? Infinity : -Infinity;
+                else if (_p2[1] == _p1[1])
+                    return _p2[0] > _p1[0] ? 0 : -0;
+                else
+                    return (_p2[1] - _p1[1]) / (_p2[0] - _p1[0]);
+            });
+        },
+        /**
+         * @name Biltong.normal
+         * @function
+         * @desc Calculates the gradient of a normal to a line between the two points.
+         * @param {Point} p1 First point, either as a 2 entry array or object with `left` and `top` properties.
+         * @param {Point} p2 Second point, either as a 2 entry array or object with `left` and `top` properties.
+         * @return {Float} The gradient of a normal to a line between the two points.
+         */
+        _normal = Biltong.normal = function (p1, p2) {
+            return -1 / _gradient(p1, p2);
+        },
+        /**
+         * @name Biltong.lineLength
+         * @function
+         * @desc Calculates the length of a line between the two points.
+         * @param {Point} p1 First point, either as a 2 entry array or object with `left` and `top` properties.
+         * @param {Point} p2 Second point, either as a 2 entry array or object with `left` and `top` properties.
+         * @return {Float} The length of a line between the two points.
+         */
+        _lineLength = Biltong.lineLength = function (p1, p2) {
+            return _pointHelper(p1, p2, function (_p1, _p2) {
+                return Math.sqrt(Math.pow(_p2[1] - _p1[1], 2) + Math.pow(_p2[0] - _p1[0], 2));
+            });
+        },
+        /**
+         * @name Biltong.quadrant
+         * @function
+         * @desc Calculates the quadrant in which the angle between the two points lies.
+         * @param {Point} p1 First point, either as a 2 entry array or object with `left` and `top` properties.
+         * @param {Point} p2 Second point, either as a 2 entry array or object with `left` and `top` properties.
+         * @return {Integer} The quadrant - 1 for upper right, 2 for lower right, 3 for lower left, 4 for upper left.
+         */
+        _quadrant = Biltong.quadrant = function (p1, p2) {
+            return _pointHelper(p1, p2, function (_p1, _p2) {
+                if (_p2[0] > _p1[0]) {
+                    return (_p2[1] > _p1[1]) ? 2 : 1;
+                } else if (_p2[0] == _p1[0]) {
+                    return _p2[1] > _p1[1] ? 2 : 1;
+                } else {
+                    return (_p2[1] > _p1[1]) ? 3 : 4;
+                }
+            });
+        },
+        /**
+         * @name Biltong.theta
+         * @function
+         * @desc Calculates the angle between the two points.
+         * @param {Point} p1 First point, either as a 2 entry array or object with `left` and `top` properties.
+         * @param {Point} p2 Second point, either as a 2 entry array or object with `left` and `top` properties.
+         * @return {Float} The angle between the two points.
+         */
+        _theta = Biltong.theta = function (p1, p2) {
+            return _pointHelper(p1, p2, function (_p1, _p2) {
+                var m = _gradient(_p1, _p2),
+                    t = Math.atan(m),
+                    s = _quadrant(_p1, _p2);
+                if ((s == 4 || s == 3)) t += Math.PI;
+                if (t < 0) t += (2 * Math.PI);
+
+                return t;
+            });
+        },
+        /**
+         * @name Biltong.intersects
+         * @function
+         * @desc Calculates whether or not the two rectangles intersect.
+         * @param {Rectangle} r1 First rectangle, as a js object in the form `{x:.., y:.., w:.., h:..}`
+         * @param {Rectangle} r2 Second rectangle, as a js object in the form `{x:.., y:.., w:.., h:..}`
+         * @return {Boolean} True if the rectangles intersect, false otherwise.
+         */
+        _intersects = Biltong.intersects = function (r1, r2) {
+            var x1 = r1.x,
+                x2 = r1.x + r1.w,
+                y1 = r1.y,
+                y2 = r1.y + r1.h,
+                a1 = r2.x,
+                a2 = r2.x + r2.w,
+                b1 = r2.y,
+                b2 = r2.y + r2.h;
+
+            return ((x1 <= a1 && a1 <= x2) && (y1 <= b1 && b1 <= y2)) ||
+                ((x1 <= a2 && a2 <= x2) && (y1 <= b1 && b1 <= y2)) ||
+                ((x1 <= a1 && a1 <= x2) && (y1 <= b2 && b2 <= y2)) ||
+                ((x1 <= a2 && a1 <= x2) && (y1 <= b2 && b2 <= y2)) ||
+                ((a1 <= x1 && x1 <= a2) && (b1 <= y1 && y1 <= b2)) ||
+                ((a1 <= x2 && x2 <= a2) && (b1 <= y1 && y1 <= b2)) ||
+                ((a1 <= x1 && x1 <= a2) && (b1 <= y2 && y2 <= b2)) ||
+                ((a1 <= x2 && x1 <= a2) && (b1 <= y2 && y2 <= b2));
+        },
+        /**
+         * @name Biltong.encloses
+         * @function
+         * @desc Calculates whether or not r2 is completely enclosed by r1.
+         * @param {Rectangle} r1 First rectangle, as a js object in the form `{x:.., y:.., w:.., h:..}`
+         * @param {Rectangle} r2 Second rectangle, as a js object in the form `{x:.., y:.., w:.., h:..}`
+         * @param {Boolean} [allowSharedEdges=false] If true, the concept of enclosure allows for one or more edges to be shared by the two rectangles.
+         * @return {Boolean} True if r1 encloses r2, false otherwise.
+         */
+        _encloses = Biltong.encloses = function (r1, r2, allowSharedEdges) {
+            var x1 = r1.x,
+                x2 = r1.x + r1.w,
+                y1 = r1.y,
+                y2 = r1.y + r1.h,
+                a1 = r2.x,
+                a2 = r2.x + r2.w,
+                b1 = r2.y,
+                b2 = r2.y + r2.h,
+                c = function (v1, v2, v3, v4) {
+                    return allowSharedEdges ? v1 <= v2 && v3 >= v4 : v1 < v2 && v3 > v4;
+                };
+
+            return c(x1, a1, x2, a2) && c(y1, b1, y2, b2);
+        },
+        _segmentMultipliers = [null, [1, -1], [1, 1], [-1, 1], [-1, -1]],
+        _inverseSegmentMultipliers = [null, [-1, -1], [-1, 1], [1, 1], [1, -1]],
+        /**
+         * @name Biltong.pointOnLine
+         * @function
+         * @desc Calculates a point on the line from `fromPoint` to `toPoint` that is `distance` units along the length of the line.
+         * @param {Point} p1 First point, either as a 2 entry array or object with `left` and `top` properties.
+         * @param {Point} p2 Second point, either as a 2 entry array or object with `left` and `top` properties.
+         * @return {Point} Point on the line, in the form `{ x:..., y:... }`.
+         */
+        _pointOnLine = Biltong.pointOnLine = function (fromPoint, toPoint, distance) {
+            var m = _gradient(fromPoint, toPoint),
+                s = _quadrant(fromPoint, toPoint),
+                segmentMultiplier = distance > 0 ? _segmentMultipliers[s] : _inverseSegmentMultipliers[s],
+                theta = Math.atan(m),
+                y = Math.abs(distance * Math.sin(theta)) * segmentMultiplier[1],
+                x = Math.abs(distance * Math.cos(theta)) * segmentMultiplier[0];
+            return {
+                x: fromPoint.x + x,
+                y: fromPoint.y + y
+            };
+        },
+        /**
+         * @name Biltong.perpendicularLineTo
+         * @function
+         * @desc Calculates a line of length `length` that is perpendicular to the line from `fromPoint` to `toPoint` and passes through `toPoint`.
+         * @param {Point} p1 First point, either as a 2 entry array or object with `left` and `top` properties.
+         * @param {Point} p2 Second point, either as a 2 entry array or object with `left` and `top` properties.
+         * @return {Line} Perpendicular line, in the form `[ { x:..., y:... }, { x:..., y:... } ]`.
+         */
+        _perpendicularLineTo = Biltong.perpendicularLineTo = function (fromPoint, toPoint, length) {
+            var m = _gradient(fromPoint, toPoint),
+                theta2 = Math.atan(-1 / m),
+                y = length / 2 * Math.sin(theta2),
+                x = length / 2 * Math.cos(theta2);
+            return [{
+                x: toPoint.x + x,
+                y: toPoint.y + y
+            }, {
+                x: toPoint.x - x,
+                y: toPoint.y - y
+            }];
+        };
+})(typeof exports !== undefined ? exports : this);;
+(function (global) {
+
+    "use strict";
+
+    var Sniff = {
+        android: navigator.userAgent.toLowerCase().indexOf("android") > -1
+    };
+
+    var matchesSelector = function (el, selector, ctx) {
+            ctx = ctx || el.parentNode;
+            var possibles = ctx.querySelectorAll(selector);
+            for (var i = 0; i < possibles.length; i++) {
+                if (possibles[i] === el) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        _gel = function (el) {
+            return typeof el == "string" ? document.getElementById(el) : el;
+        },
+        _t = function (e) {
+            return e.srcElement || e.target;
+        },
+        _d = function (l, fn) {
+            for (var i = 0, j = l.length; i < j; i++) {
+                if (l[i] == fn) break;
+            }
+            if (i < l.length) l.splice(i, 1);
+        },
+        guid = 1,
+        //
+        // this function generates a guid for every handler, sets it on the handler, then adds
+        // it to the associated object's map of handlers for the given event. this is what enables us 
+        // to unbind all events of some type, or all events (the second of which can be requested by the user, 
+        // but it also used by Mottle when an element is removed.)
+        _store = function (obj, event, fn) {
+            var g = guid++;
+            obj.__ta = obj.__ta || {};
+            obj.__ta[event] = obj.__ta[event] || {};
+            // store each handler with a unique guid.
+            obj.__ta[event][g] = fn;
+            // set the guid on the handler.
+            fn.__tauid = g;
+            return g;
+        },
+        _unstore = function (obj, event, fn) {
+            obj.__ta && obj.__ta[event] && delete obj.__ta[event][fn.__tauid];
+            // a handler might have attached extra functions, so we unbind those too.
+            if (fn.__taExtra) {
+                for (var i = 0; i < fn.__taExtra.length; i++) {
+                    _unbind(obj, fn.__taExtra[i][0], fn.__taExtra[i][1]);
+                }
+                fn.__taExtra.length = 0;
+            }
+            // a handler might have attached an unstore callback
+            fn.__taUnstore && fn.__taUnstore();
+        },
+        _curryChildFilter = function (children, obj, fn, evt) {
+            if (children === null) return fn;
+            else {
+                var c = children.split(","),
+                    _fn = function (e) {
+                        _fn.__tauid = fn.__tauid;
+                        var t = _t(e);
+                        for (var i = 0; i < c.length; i++) {
+                            if (matchesSelector(t, c[i], obj)) {
+                                fn.apply(t, arguments);
+                            }
+                        }
+                    };
+                registerExtraFunction(fn, evt, _fn);
+                return _fn;
+            }
+        },
+        //
+        // registers an 'extra' function on some event listener function we were given - a function that we
+        // created and bound to the element as part of our housekeeping, and which we want to unbind and remove
+        // whenever the given function is unbound.
+        registerExtraFunction = function (fn, evt, newFn) {
+            fn.__taExtra = fn.__taExtra || [];
+            fn.__taExtra.push([evt, newFn]);
+        },
+        DefaultHandler = function (obj, evt, fn, children) {
+            // TODO: this was here originally because i wanted to handle devices that are both touch AND mouse. however this can cause certain of the helper
+            // functions to be bound twice, as - for example - on a nexus 4, both a mouse event and a touch event are fired.  the use case i had in mind
+            // was a device such as an Asus touch pad thing, which has a touch pad but can also be controlled with a mouse.
+            //if (isMouseDevice)
+            //	_bind(obj, evt, _curryChildFilter(children, obj, fn, evt), fn);
+
+            if (isTouchDevice && touchMap[evt]) {
+                _bind(obj, touchMap[evt], _curryChildFilter(children, obj, fn, touchMap[evt]), fn);
+            } else
+                _bind(obj, evt, _curryChildFilter(children, obj, fn, evt), fn);
+        },
+        SmartClickHandler = function (obj, evt, fn, children) {
+            if (obj.__taSmartClicks === null) {
+                var down = function (e) {
+                        obj.__tad = _pageLocation(e);
+                    },
+                    up = function (e) {
+                        obj.__tau = _pageLocation(e);
+                    },
+                    click = function (e) {
+                        if (obj.__tad && obj.__tau && obj.__tad[0] === obj.__tau[0] && obj.__tad[1] === obj.__tau[1]) {
+                            for (var i = 0; i < obj.__taSmartClicks.length; i++)
+                                obj.__taSmartClicks[i].apply(_t(e), [e]);
+                        }
+                    };
+                DefaultHandler(obj, "mousedown", down, children);
+                DefaultHandler(obj, "mouseup", up, children);
+                DefaultHandler(obj, "click", click, children);
+                obj.__taSmartClicks = [];
+            }
+
+            // store in the list of callbacks
+            obj.__taSmartClicks.push(fn);
+            // the unstore function removes this function from the object's listener list for this type.
+            fn.__taUnstore = function () {
+                _d(obj.__taSmartClicks, fn);
+            };
+        },
+        _tapProfiles = {
+            "tap": {
+                touches: 1,
+                taps: 1
+            },
+            "dbltap": {
+                touches: 1,
+                taps: 2
+            },
+            "contextmenu": {
+                touches: 2,
+                taps: 1
+            }
+        },
+        TapHandler = function (clickThreshold, dblClickThreshold) {
+            return function (obj, evt, fn, children) {
+                // if event is contextmenu, for devices which are mouse only, we want to
+                // use the default bind. 
+                if (evt == "contextmenu" && isMouseDevice)
+                    DefaultHandler(obj, evt, fn, children);
+                else {
+                    // the issue here is that this down handler gets registered only for the
+                    // child nodes in the first registration. in fact it should be registered with
+                    // no child selector and then on down we should cycle through the regustered
+                    // functions to see if one of them matches. on mouseup we should execute ALL of
+                    // the functions whose children are either null or match the element.
+                    if (obj.__taTapHandler === null) {
+                        var tt = obj.__taTapHandler = {
+                            tap: [],
+                            dbltap: [],
+                            contextmenu: [],
+                            down: false,
+                            taps: 0,
+                            downSelectors: []
+                        };
+                        var down = function (e) {
+                                var target = e.srcElement || e.target;
+                                for (var i = 0; i < tt.downSelectors.length; i++) {
+                                    if (tt.downSelectors[i] === null || matchesSelector(target, tt.downSelectors[i], obj)) {
+                                        tt.down = true;
+                                        setTimeout(clearSingle, clickThreshold);
+                                        setTimeout(clearDouble, dblClickThreshold);
+                                        break; // we only need one match on mousedown
+                                    }
+                                }
+                            },
+                            up = function (e) {
+                                if (tt.down) {
+                                    var target = e.srcElement || e.target;
+                                    tt.taps++;
+                                    var tc = _touchCount(e);
+                                    for (var eventId in _tapProfiles) {
+                                        var p = _tapProfiles[eventId];
+                                        if (p.touches === tc && (p.taps === 1 || p.taps === tt.taps)) {
+                                            for (var i = 0; i < tt[eventId].length; i++) {
+                                                if (tt[eventId][i][1] === null || matchesSelector(target, tt[eventId][i][1], obj))
+                                                    tt[eventId][i][0].apply(_t(e), [e]);
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            clearSingle = function () {
+                                tt.down = false;
+                            },
+                            clearDouble = function () {
+                                tt.taps = 0;
+                            };
+
+                        DefaultHandler(obj, "mousedown", down /*, children*/ );
+                        DefaultHandler(obj, "mouseup", up /*, children*/ );
+                    }
+                    // add this child selector (it can be null, that's fine).
+                    obj.__taTapHandler.downSelectors.push(children);
+
+                    obj.__taTapHandler[evt].push([fn, children]);
+                    // the unstore function removes this function from the object's listener list for this type.
+                    fn.__taUnstore = function () {
+                        _d(obj.__taTapHandler[evt], fn);
+                    };
+                }
+            };
+        },
+        meeHelper = function (type, evt, obj, target) {
+            for (var i in obj.__tamee[type]) {
+                obj.__tamee[type][i].apply(target, [evt]);
+            }
+        },
+        MouseEnterExitHandler = function () {
+            var activeElements = [];
+            return function (obj, evt, fn, children) {
+                if (!obj.__tamee) {
+                    // __tamee holds a flag saying whether the mouse is currently "in" the element, and a list of
+                    // both mouseenter and mouseexit functions.
+                    obj.__tamee = {
+                        over: false,
+                        mouseenter: [],
+                        mouseexit: []
+                    };
+                    // register over and out functions
+                    var over = function (e) {
+                            var t = _t(e);
+                            if ((children == null && (t == obj && !obj.__tamee.over)) || (matchesSelector(t, children, obj) && (t.__tamee === null || !t.__tamee.over))) {
+                                meeHelper("mouseenter", e, obj, t);
+                                t.__tamee = t.__tamee || {};
+                                t.__tamee.over = true;
+                                activeElements.push(t);
+                            }
+                        },
+                        out = function (e) {
+                            var t = _t(e);
+                            // is the current target one of the activeElements? and is the 
+                            // related target NOT a descendant of it?
+                            for (var i = 0; i < activeElements.length; i++) {
+                                if (t == activeElements[i] && !matchesSelector((e.relatedTarget || e.toElement), "*", t)) {
+                                    t.__tamee.over = false;
+                                    activeElements.splice(i, 1);
+                                    meeHelper("mouseexit", e, obj, t);
+                                }
+                            }
+                        };
+
+                    _bind(obj, "mouseover", _curryChildFilter(children, obj, over, "mouseover"), over);
+                    _bind(obj, "mouseout", _curryChildFilter(children, obj, out, "mouseout"), out);
+                }
+
+                fn.__taUnstore = function () {
+                    delete obj.__tamee[evt][fn.__tauid];
+                };
+
+                _store(obj, evt, fn);
+                obj.__tamee[evt][fn.__tauid] = fn;
+            };
+        },
+        isTouchDevice = "ontouchstart" in document.documentElement,
+        isMouseDevice = "onmousedown" in document.documentElement,
+        touchMap = {
+            "mousedown": "touchstart",
+            "mouseup": "touchend",
+            "mousemove": "touchmove"
+        },
+        touchstart = "touchstart",
+        touchend = "touchend",
+        touchmove = "touchmove",
+        ta_down = "__MottleDown",
+        ta_up = "__MottleUp",
+        ta_context_down = "__MottleContextDown",
+        ta_context_up = "__MottleContextUp",
+        iev = (function () {
+            var rv = -1;
+            if (navigator.appName == 'Microsoft Internet Explorer') {
+                var ua = navigator.userAgent,
+                    re = new RegExp("MSIE ([0-9]{1,}[\.0-9]{0,})");
+                if (re.exec(ua) !== null)
+                    rv = parseFloat(RegExp.$1);
+            }
+            return rv;
+        })(),
+        isIELT9 = iev > -1 && iev < 9,
+        _genLoc = function (e, prefix) {
+            if (e === null) return [0, 0];
+            var ts = _touches(e),
+                t = _getTouch(ts, 0);
+            return [t[prefix + "X"], t[prefix + "Y"]];
+        },
+        _pageLocation = function (e) {
+            if (e === null) return [0, 0];
+            if (isIELT9) {
+                return [e.clientX + document.documentElement.scrollLeft, e.clientY + document.documentElement.scrollTop];
+            } else {
+                return _genLoc(e, "page");
+            }
+        },
+        _screenLocation = function (e) {
+            return _genLoc(e, "screen");
+        },
+        _clientLocation = function (e) {
+            return _genLoc(e, "client");
+        },
+        _getTouch = function (touches, idx) {
+            return touches.item ? touches.item(idx) : touches[idx];
+        },
+        _touches = function (e) {
+            return e.touches && e.touches.length > 0 ? e.touches :
+                e.changedTouches && e.changedTouches.length > 0 ? e.changedTouches :
+                e.targetTouches && e.targetTouches.length > 0 ? e.targetTouches : [e];
+        },
+        _touchCount = function (e) {
+            return _touches(e).length;
+        },
+        //http://www.quirksmode.org/blog/archives/2005/10/_and_the_winner_1.html
+        _bind = function (obj, type, fn, originalFn) {
+            _store(obj, type, fn);
+            originalFn.__tauid = fn.__tauid;
+            if (obj.addEventListener)
+                obj.addEventListener(type, fn, false);
+            else if (obj.attachEvent) {
+                var key = type + fn.__tauid;
+                obj["e" + key] = fn;
+                // TODO look at replacing with .call(..)
+                obj[key] = function () {
+                    obj["e" + key] && obj["e" + key](global.event);
+                };
+                obj.attachEvent("on" + type, obj[key]);
+            }
+        },
+        _unbind = function (obj, type, fn) {
+            if (fn === null) return;
+            _each(obj, function () {
+                var _el = _gel(this);
+                _unstore(_el, type, fn);
+                // it has been bound if there is a tauid. otherwise it was not bound and we can ignore it.
+                if (fn.__tauid !== null) {
+                    if (_el.removeEventListener)
+                        _el.removeEventListener(type, fn, false);
+                    else if (this.detachEvent) {
+                        var key = type + fn.__tauid;
+                        _el[key] && _el.detachEvent("on" + type, _el[key]);
+                        _el[key] = null;
+                        _el["e" + key] = null;
+                    }
+                }
+            });
+        },
+        _devNull = function () {},
+        _each = function (obj, fn) {
+            if (obj === null) return;
+            // if a list (or list-like), use it. if a string, get a list 
+            // by running the string through querySelectorAll. else, assume 
+            // it's an Element.
+            obj = (typeof obj !== "string") && (obj.tagName === null && obj.length !== null) ? obj : typeof obj === "string" ? document.querySelectorAll(obj) : [obj];
+            for (var i = 0; i < obj.length; i++)
+                fn.apply(obj[i]);
+        };
+
+    /**
+     * Event handler.  Offers support for abstracting out the differences
+     * between touch and mouse devices, plus "smart click" functionality
+     * (don't fire click if the mouse has moved betweeb mousedown and mouseup),
+     * and synthesized click/tap events.
+     * @class Mottle
+     * @constructor
+     * @param {Object} params Constructor params
+     * @param {Integer} [params.clickThreshold=150] Threshold, in milliseconds beyond which a touchstart followed by a touchend is not considered to be a click.
+     * @param {Integer} [params.dblClickThreshold=350] Threshold, in milliseconds beyond which two successive tap events are not considered to be a click.
+     * @param {Boolean} [params.smartClicks=false] If true, won't fire click events if the mouse has moved between mousedown and mouseup. Note that this functionality
+     * requires that Mottle consume the mousedown event, and so may not be viable in all use cases.
+     */
+    this.Mottle = function (params) {
+        params = params || {};
+        var self = this,
+            clickThreshold = params.clickThreshold || 150,
+            dblClickThreshold = params.dblClickThreshold || 350,
+            mouseEnterExitHandler = new MouseEnterExitHandler(),
+            tapHandler = new TapHandler(clickThreshold, dblClickThreshold),
+            _smartClicks = params.smartClicks,
+            _doBind = function (obj, evt, fn, children) {
+                if (fn === null) return;
+                _each(obj, function () {
+                    var _el = _gel(this);
+                    if (_smartClicks && evt === "click")
+                        SmartClickHandler(_el, evt, fn, children);
+                    else if (evt === "tap" || evt === "dbltap" || evt === "contextmenu") {
+                        tapHandler(_el, evt, fn, children);
+                    } else if (evt === "mouseenter" || evt == "mouseexit")
+                        mouseEnterExitHandler(_el, evt, fn, children);
+                    else
+                        DefaultHandler(_el, evt, fn, children);
+                });
+            };
+
+        /**
+         * Removes an element from the DOM, and unregisters all event handlers for it. You should use this
+         * to ensure you don't leak memory.
+         * @method remove
+         * @param {String|Element} el Element, or id of the element, to remove.
+         * @return {Mottle} The current Mottle instance; you can chain this method.
+         */
+        this.remove = function (el) {
+            _each(el, function () {
+                var _el = _gel(this);
+                if (_el.__ta) {
+                    for (var evt in _el.__ta) {
+                        for (var h in _el.__ta[evt]) {
+                            _unbind(_el, evt, _el.__ta[evt][h]);
+                        }
+                    }
+                }
+                _el.parentNode && _el.parentNode.removeChild(_el);
+            });
+            return this;
+        };
+
+        /**
+         * Register an event handler, optionally as a delegate for some set of descendant elements. Note
+         * that this method takes either 3 or 4 arguments - if you supply 3 arguments it is assumed you have
+         * omitted the `children` parameter, and that the event handler should be bound directly to the given element.
+         * @method on
+         * @param {Element[]|Element|String} el Either an Element, or a CSS spec for a list of elements, or an array of Elements.
+         * @param {String} [children] Comma-delimited list of selectors identifying allowed children.
+         * @param {String} event Event ID.
+         * @param {Function} fn Event handler function.
+         * @return {Mottle} The current Mottle instance; you can chain this method.
+         */
+        this.on = function (el, event, children, fn) {
+            var _el = arguments[0],
+                _c = arguments.length == 4 ? arguments[2] : null,
+                _e = arguments[1],
+                _f = arguments[arguments.length - 1];
+
+            _doBind(_el, _e, _f, _c);
+            return this;
+        };
+
+        /**
+         * Cancel delegate event handling for the given function. Note that unlike with 'on' you do not supply
+         * a list of child selectors here: it removes event delegation from all of the child selectors for which the
+         * given function was registered (if any).
+         * @method off
+         * @param {Element[]|Element|String} el Element - or ID of element - from which to remove event listener.
+         * @param {String} event Event ID.
+         * @param {Function} fn Event handler function.
+         * @return {Mottle} The current Mottle instance; you can chain this method.
+         */
+        this.off = function (el, evt, fn) {
+            _unbind(el, evt, fn);
+            return this;
+        };
+
+        /**
+         * Triggers some event for a given element.
+         * @method trigger
+         * @param {Element} el Element for which to trigger the event.
+         * @param {String} event Event ID.
+         * @param {Event} originalEvent The original event. Should be optional of course, but currently is not, due
+         * to the jsPlumb use case that caused this method to be added.
+         * @param {Object} [payload] Optional object to set as `payload` on the generated event; useful for message passing.
+         * @return {Mottle} The current Mottle instance; you can chain this method.
+         */
+        this.trigger = function (el, event, originalEvent, payload) {
+            var eventToBind = (isTouchDevice && touchMap[event]) ? touchMap[event] : event;
+            var pl = _pageLocation(originalEvent),
+                sl = _screenLocation(originalEvent),
+                cl = _clientLocation(originalEvent);
+            _each(el, function () {
+                var _el = _gel(this),
+                    evt;
+                originalEvent = originalEvent || {
+                    screenX: sl[0],
+                    screenY: sl[1],
+                    clientX: cl[0],
+                    clientY: cl[1]
+                };
+
+                var _decorate = function (_evt) {
+                    if (payload) _evt.payload = payload;
+                };
+
+                var eventGenerators = {
+                    "TouchEvent": function (evt) {
+                        var t = document.createTouch(window, _el, 0, pl[0], pl[1],
+                            sl[0], sl[1],
+                            cl[0], cl[1],
+                            0, 0, 0, 0);
+
+                        evt.initTouchEvent(eventToBind, true, true, window, 0,
+                            sl[0], sl[1],
+                            cl[0], cl[1],
+                            false, false, false, false, document.createTouchList(t));
+                    },
+                    "MouseEvents": function (evt) {
+                        evt.initMouseEvent(eventToBind, true, true, window, 0,
+                            sl[0], sl[1],
+                            cl[0], cl[1],
+                            false, false, false, false, 1, _el);
+
+                        if (Sniff.android) {
+                            // Android's touch events are not standard.
+                            var t = document.createTouch(window, _el, 0, pl[0], pl[1],
+                                sl[0], sl[1],
+                                cl[0], cl[1],
+                                0, 0, 0, 0);
+
+                            evt.touches = evt.targetTouches = evt.changedTouches = document.createTouchList(t);
+                        }
+                    }
+                };
+
+                if (document.createEvent) {
+                    var ite = (isTouchDevice && touchMap[event] && !Sniff.android),
+                        evtName = ite ? "TouchEvent" : "MouseEvents";
+                    evt = document.createEvent(evtName);
+                    eventGenerators[evtName](evt);
+                    _decorate(evt);
+                    _el.dispatchEvent(evt);
+                } else if (document.createEventObject) {
+                    evt = document.createEventObject();
+                    evt.eventType = evt.eventName = eventToBind;
+                    evt.screenX = sl[0];
+                    evt.screenY = sl[1];
+                    evt.clientX = cl[0];
+                    evt.clientY = cl[1];
+                    _decorate(evt);
+                    _el.fireEvent('on' + eventToBind, evt);
+                }
+            });
+            return this;
+        }
+    };
+
+    /**
+     * Static method to assist in 'consuming' an element: uses `stopPropagation` where available, or sets `e.returnValue=false` where it is not.
+     * @method Mottle.consume
+     * @param {Event} e Event to consume
+     * @param {Boolean} [doNotPreventDefault=false] If true, does not call `preventDefault()` on the event.
+     */
+    Mottle.consume = function (e, doNotPreventDefault) {
+        if (e.stopPropagation)
+            e.stopPropagation();
+        else
+            e.returnValue = false;
+
+        if (!doNotPreventDefault && e.preventDefault)
+            e.preventDefault();
+    };
+
+    /**
+     * Gets the page location corresponding to the given event. For touch events this means get the page location of the first touch.
+     * @method Mottle.pageLocation
+     * @param {Event} e Event to get page location for.
+     * @return {Integer[]} [left, top] for the given event.
+     */
+    Mottle.pageLocation = _pageLocation;
+})(typeof exports !== undefined ? exports : this);
+/**
+ drag/drop functionality for use with jsPlumb but with
+ no knowledge of global.jsPlumb. supports multiple scopes (separated by whitespace), dragging
+ multiple elements, constrain to parent, drop filters, drag start filters, custom
+ css classes.
+
+ a lot of the functionality of this script is expected to be plugged in:
+
+ addClass
+ removeClass
+
+ addEvent
+ removeEvent
+
+ getPosition
+ setPosition
+ getSize
+
+ indexOf
+ intersects
+
+ the name came from here:
+
+ http://mrsharpoblunto.github.io/foswig.js/
+
+ copyright 2014 jsPlumb
+ */
+
+;
+(function (global) {
+
+    "use strict";
+
+    var getOffsetRect = function (elem) {
+        // (1)
+        var box = elem.getBoundingClientRect();
+
+        var body = document.body;
+        var docElem = document.documentElement;
+
+        // (2)
+        var scrollTop = global.pageYOffset || docElem.scrollTop || body.scrollTop;
+        var scrollLeft = global.pageXOffset || docElem.scrollLeft || body.scrollLeft;
+
+        // (3)
+        var clientTop = docElem.clientTop || body.clientTop || 0;
+        var clientLeft = docElem.clientLeft || body.clientLeft || 0;
+
+        // (4)
+        var top = box.top + scrollTop - clientTop;
+        var left = box.left + scrollLeft - clientLeft;
+
+        return {
+            top: Math.round(top),
+            left: Math.round(left)
+        };
+    };
+
+    var matchesSelector = function (el, selector, ctx) {
+        ctx = ctx || el.parentNode;
+        var possibles = ctx.querySelectorAll(selector);
+        for (var i = 0; i < possibles.length; i++) {
+            if (possibles[i] === el)
+                return true;
+        }
+        return false;
+    };
+
+    var iev = (function () {
+            var rv = -1;
+            if (navigator.appName == 'Microsoft Internet Explorer') {
+                var ua = navigator.userAgent,
+                    re = new RegExp("MSIE ([0-9]{1,}[\.0-9]{0,})");
+                if (re.exec(ua) !== null)
+                    rv = parseFloat(RegExp.$1);
+            }
+            return rv;
+        })(),
+        isIELT9 = iev > -1 && iev < 9,
+        _pl = function (e) {
+            if (isIELT9) {
+                return [e.clientX + document.documentElement.scrollLeft, e.clientY + document.documentElement.scrollTop];
+            } else {
+                var ts = _touches(e),
+                    t = _getTouch(ts, 0);
+                // this is for iPad. may not fly for Android.
+                return [t.pageX, t.pageY];
+            }
+        },
+        _getTouch = function (touches, idx) {
+            return touches.item ? touches.item(idx) : touches[idx];
+        },
+        _touches = function (e) {
+            return e.touches && e.touches.length > 0 ? e.touches :
+                e.changedTouches && e.changedTouches.length > 0 ? e.changedTouches :
+                e.targetTouches && e.targetTouches.length > 0 ? e.targetTouches : [e];
+        },
+        _classes = {
+            draggable: "katavorio-draggable", // draggable elements
+            droppable: "katavorio-droppable", // droppable elements
+            drag: "katavorio-drag", // elements currently being dragged            
+            selected: "katavorio-drag-selected", // elements in current drag selection
+            active: "katavorio-drag-active", // droppables that are targets of a currently dragged element
+            hover: "katavorio-drag-hover", // droppables over which a matching drag element is hovering
+            noSelect: "katavorio-drag-no-select" // added to the body to provide a hook to suppress text selection
+        },
+        _defaultScope = "katavorio-drag-scope",
+        _events = ["stop", "start", "drag", "drop", "over", "out"],
+        _devNull = function () {},
+        _true = function () {
+            return true;
+        },
+        _foreach = function (l, fn, from) {
+            for (var i = 0; i < l.length; i++) {
+                if (l[i] != from)
+                    fn(l[i]);
+            }
+        },
+        _setDroppablesActive = function (dd, val, andHover, drag) {
+            _foreach(dd, function (e) {
+                e.setActive(val);
+                if (val) e.updatePosition();
+                if (andHover) e.setHover(drag, val);
+            });
+        },
+        _each = function (obj, fn) {
+            if (obj === null) return;
+            obj = (typeof obj !== "string") && (obj.tagName === null && obj.length !== null) ? obj : [obj];
+            for (var i = 0; i < obj.length; i++)
+                fn.apply(obj[i], [obj[i]]);
+        },
+        _consume = function (e) {
+            if (e.stopPropagation) {
+                e.stopPropagation();
+                e.preventDefault();
+            } else {
+                e.returnValue = false;
+            }
+        },
+        _defaultInputFilterSelector = "input,textarea,select,button",
+        //
+        // filters out events on all input elements, like textarea, checkbox, input, select.
+        _inputFilter = function (e, el, _katavorio) {
+            var t = e.srcElement || e.target;
+            return !matchesSelector(t, _katavorio.getInputFilterSelector(), el);
+        };
+
+    var Super = function (el, params, css, scope) {
+        this.params = params || {};
+        this.el = el;
+        this.params.addClass(this.el, this._class);
+        var enabled = true;
+        this.setEnabled = function (e) {
+            enabled = e;
+        };
+        this.isEnabled = function () {
+            return enabled;
+        };
+        this.toggleEnabled = function () {
+            enabled = !enabled;
+        };
+        this.setScope = function (scopes) {
+            this.scopes = scopes ? scopes.split(/\s+/) : [scope];
+        };
+        this.addScope = function (scopes) {
+            var m = {};
+            _each(this.scopes, function (s) {
+                m[s] = true;
+            });
+            _each(scopes ? scopes.split(/\s+/) : [], function (s) {
+                m[s] = true;
+            });
+            this.scopes = [];
+            for (var i in m) this.scopes.push(i);
+        };
+        this.removeScope = function (scopes) {
+            var m = {};
+            _each(this.scopes, function (s) {
+                m[s] = true;
+            });
+            _each(scopes ? scopes.split(/\s+/) : [], function (s) {
+                delete m[s];
+            });
+            this.scopes = [];
+            for (var i in m) this.scopes.push(i);
+        };
+        this.toggleScope = function (scopes) {
+            var m = {};
+            _each(this.scopes, function (s) {
+                m[s] = true;
+            });
+            _each(scopes ? scopes.split(/\s+/) : [], function (s) {
+                if (m[s]) delete m[s];
+                else m[s] = true;
+            });
+            this.scopes = [];
+            for (var i in m) this.scopes.push(i);
+        };
+        this.setScope(params.scope);
+        this.k = params.katavorio;
+        return params.katavorio;
+    };
+
+    var Drag = function (el, params, css, scope) {
+        this._class = css.draggable;
+        var k = Super.apply(this, arguments);
+        this.rightButtonCanDrag = this.params.rightButtonCanDrag;
+        var downAt = [0, 0],
+            posAtDown = null,
+            moving = false,
+            consumeStartEvent = this.params.consumeStartEvent !== false,
+            dragEl = this.el,
+            clone = this.params.clone;
+        this.toGrid = function (pos) {
+            return this.params.grid === null ? pos : [
+                        this.params.grid[0] * Math.floor(pos[0] / this.params.grid[0]),
+                        this.params.grid[1] * Math.floor(pos[1] / this.params.grid[1])
+                ];
+        };
+
+        this.constrain = typeof this.params.constrain === "function" ? this.params.constrain : (this.params.constrain || this.params.containment) ? function (pos) {
+            return [
+                Math.max(0, Math.min(constrainRect.w - this.size[0], pos[0])),
+                Math.max(0, Math.min(constrainRect.h - this.size[1], pos[1]))
+            ];
+        } : function (pos) {
+            return pos;
+        };
+
+        var filter = _true,
+            filterSpec = "",
+            filterExclude = this.params.filterExclude !== false,
+            _setFilter = this.setFilter = function (f, _exclude) {
+                if (f) {
+                    filterSpec = f;
+                    filterExclude = _exclude !== false;
+                    filter = function (e) {
+                        var t = e.srcElement || e.target,
+                            ms = matchesSelector(t, f, el);
+                        return filterExclude ? !ms : ms;
+                    };
+                }
+            };
+        this.canDrag = this.params.canDrag || _true;
+
+        var constrainRect,
+            matchingDroppables = [],
+            intersectingDroppables = [];
+
+        this.downListener = function (e) {
+            var isNotRightClick = this.rightButtonCanDrag || (e.which !== 3 && e.button !== 2);
+            if (isNotRightClick && this.isEnabled() && this.canDrag()) {
+                var _f = filter(e) && _inputFilter(e, this.el, this.k);
+                if (_f) {
+                    if (!clone)
+                        dragEl = this.el;
+                    else {
+                        dragEl = this.el.cloneNode(true);
+                        dragEl.setAttribute("id", null);
+                        dragEl.style.position = "absolute";
+                        // the clone node is added to the body; getOffsetRect gives us a value
+                        // relative to the body.
+                        var b = getOffsetRect(this.el);
+                        dragEl.style.left = b.left + "px";
+                        dragEl.style.top = b.top + "px";
+                        document.body.appendChild(dragEl);
+                    }
+                    consumeStartEvent && _consume(e);
+                    downAt = _pl(e);
+                    //
+                    this.params.bind(document, "mousemove", this.moveListener);
+                    this.params.bind(document, "mouseup", this.upListener);
+                    k.markSelection(this);
+                    this.params.addClass(document.body, css.noSelect);
+                } else if (this.params.consumeFilteredEvents) {
+                    _consume(e);
+                }
+            }
+        }.bind(this);
+
+        this.moveListener = function (e) {
+            if (downAt) {
+                if (!moving) {
+                    this.params.events["start"]({
+                        el: this.el,
+                        pos: posAtDown,
+                        e: e,
+                        drag: this
+                    });
+                    this.mark();
+                    moving = true;
+                }
+
+                intersectingDroppables.length = 0;
+                var pos = _pl(e),
+                    dx = pos[0] - downAt[0],
+                    dy = pos[1] - downAt[1],
+                    z = this.params.ignoreZoom ? 1 : k.getZoom();
+                dx /= z;
+                dy /= z;
+                this.moveBy(dx, dy, e);
+                k.updateSelection(dx, dy, this);
+            }
+        }.bind(this);
+
+        this.upListener = function (e) {
+            downAt = null;
+            moving = false;
+            this.params.unbind(document, "mousemove", this.moveListener);
+            this.params.unbind(document, "mouseup", this.upListener);
+            this.params.removeClass(document.body, css.noSelect);
+            this.unmark(e);
+            k.unmarkSelection(this, e);
+            this.stop(e);
+            k.notifySelectionDragStop(this, e);
+            if (clone) {
+                dragEl && dragEl.parentNode && dragEl.parentNode.removeChild(dragEl);
+                dragEl = null;
+            }
+        }.bind(this);
+
+        this.getFilter = function () {
+            return filterSpec;
+        };
+        this.isFilterExclude = function () {
+            return filterExclude;
+        };
+
+        this.abort = function () {
+            if (downAt !== null)
+                this.upListener();
+        };
+
+        this.getDragElement = function () {
+            return dragEl || this.el;
+        };
+
+        this.stop = function (e) {
+            this.params.events["stop"]({
+                el: dragEl,
+                pos: this.params.getPosition(dragEl),
+                e: e,
+                drag: this
+            });
+        };
+
+        this.mark = function () {
+            posAtDown = this.params.getPosition(dragEl);
+            this.size = this.params.getSize(dragEl);
+            matchingDroppables = k.getMatchingDroppables(this);
+            _setDroppablesActive(matchingDroppables, true, false, this);
+            this.params.addClass(dragEl, this.params.dragClass || css.drag);
+            if (this.params.constrain || this.params.containment) {
+                var cs = this.params.getSize(dragEl.parentNode);
+                constrainRect = {
+                    w: cs[0],
+                    h: cs[1]
+                };
+            }
+        };
+        this.unmark = function (e) {
+            _setDroppablesActive(matchingDroppables, false, true, this);
+            matchingDroppables.length = 0;
+            for (var i = 0; i < intersectingDroppables.length; i++)
+                intersectingDroppables[i].drop(this, e);
+        };
+        this.moveBy = function (dx, dy, e) {
+            intersectingDroppables.length = 0;
+            var cPos = this.constrain(this.toGrid(([posAtDown[0] + dx, posAtDown[1] + dy])), dragEl),
+                rect = {
+                    x: cPos[0],
+                    y: cPos[1],
+                    w: this.size[0],
+                    h: this.size[1]
+                };
+            this.params.setPosition(dragEl, cPos);
+            for (var i = 0; i < matchingDroppables.length; i++) {
+                var r2 = {
+                    x: matchingDroppables[i].position[0],
+                    y: matchingDroppables[i].position[1],
+                    w: matchingDroppables[i].size[0],
+                    h: matchingDroppables[i].size[1]
+                };
+                if (this.params.intersects(rect, r2) && matchingDroppables[i].canDrop(this)) {
+                    intersectingDroppables.push(matchingDroppables[i]);
+                    matchingDroppables[i].setHover(this, true, e);
+                } else if (matchingDroppables[i].el._katavorioDragHover) {
+                    matchingDroppables[i].setHover(this, false, e);
+                }
+            }
+            this.params.events["drag"]({
+                el: this.el,
+                pos: cPos,
+                e: e,
+                drag: this
+            });
+        };
+        this.destroy = function () {
+            this.params.unbind(this.el, "mousedown", this.downListener);
+            this.params.unbind(document, "mousemove", this.moveListener);
+            this.params.unbind(document, "mouseup", this.upListener);
+            this.downListener = null;
+            this.upListener = null;
+            this.moveListener = null;
+            //this.params = null;
+            //this.el = null;
+            //dragEl = null;
+        };
+
+        // init:register mousedown, and perhaps set a filter
+        this.params.bind(this.el, "mousedown", this.downListener);
+
+        // if handle provded, use that.  otherwise, try to set a filter.
+        // note that a `handle` selector always results in filterExclude being set to false, ie.
+        // the selector defines the handle element(s).
+        if (this.params.handle)
+            _setFilter(this.params.handle, false);
+        else
+            _setFilter(this.params.filter, this.params.filterExclude);
+    };
+
+    var Drop = function (el, params, css, scope) {
+        this._class = css.droppable;
+        this.params = params || {};
+        this._activeClass = params.activeClass || css.active;
+        this._hoverClass = params.hoverClass || css.hover;
+        Super.apply(this, arguments)
+        var hover = false;
+
+        this.setActive = function (val) {
+            this.params[val ? "addClass" : "removeClass"](this.el, this._activeClass);
+        };
+
+        this.updatePosition = function () {
+            this.position = this.params.getPosition(this.el);
+            this.size = this.params.getSize(this.el);
+        };
+
+        this.canDrop = this.params.canDrop || function (drag) {
+            return true;
+        };
+
+        this.setHover = function (drag, val, e) {
+            // if turning off hover but this was not the drag that caused the hover, ignore.
+            if (val || this.el._katavorioDragHover === null || this.el._katavorioDragHover == drag.el._katavorio) {
+                this.params[val ? "addClass" : "removeClass"](this.el, this._hoverClass);
+                this.el._katavorioDragHover = val ? drag.el._katavorio : null;
+                if (hover !== val)
+                    this.params.events[val ? "over" : "out"]({
+                        el: this.el,
+                        e: e,
+                        drag: drag,
+                        drop: this
+                    });
+                hover = val;
+            }
+        };
+
+        this.drop = function (drag, event) {
+            this.params.events["drop"]({
+                drag: drag,
+                e: event,
+                drop: this
+            });
+        };
+
+        this.destroy = function () {
+            this._class = null;
+            this._activeClass = null;
+            this._hoverClass = null;
+            //this.params = null;
+            hover = null;
+            //this.el = null;
+        };
+    };
+
+    var _uuid = function () {
+        return ('xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            var r = Math.random() * 16 | 0,
+                v = c == 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        }));
+    };
+
+    var _gel = function (el) {
+        if (el === null) return null;
+        el = typeof el === "string" ? document.getElementById(el) : el;
+        if (el === null) return null;
+        el._katavorio = el._katavorio || _uuid();
+        return el;
+    };
+
+    this.Katavorio = function (katavorioParams) {
+
+        var _selection = [],
+            _selectionMap = {};
+        this._dragsByScope = {};
+        this._dropsByScope = {};
+        var _zoom = 1,
+            _reg = function (obj, map) {
+                for (var i = 0; i < obj.scopes.length; i++) {
+                    map[obj.scopes[i]] = map[obj.scopes[i]] || [];
+                    map[obj.scopes[i]].push(obj);
+                }
+            },
+            _unreg = function (obj, map) {
+                var c = 0;
+                for (var i = 0; i < obj.scopes.length; i++) {
+                    if (map[obj.scopes[i]]) {
+                        var idx = katavorioParams.indexOf(map[obj.scopes[i]], obj);
+                        if (idx != -1) {
+                            map[obj.scopes[i]].splice(idx, 1);
+                            c++;
+                        }
+                    }
+                }
+                return c > 0;
+            },
+            _getMatchingDroppables = this.getMatchingDroppables = function (drag) {
+                var dd = [],
+                    _m = {};
+                for (var i = 0; i < drag.scopes.length; i++) {
+                    var _dd = this._dropsByScope[drag.scopes[i]];
+                    if (_dd) {
+                        for (var j = 0; j < _dd.length; j++) {
+                            if (_dd[j].canDrop(drag) && !_m[_dd[j].el._katavorio] && _dd[j].el !== drag.el) {
+                                _m[_dd[j].el._katavorio] = true;
+                                dd.push(_dd[j]);
+                            }
+                        }
+                    }
+                }
+                return dd;
+            },
+            _prepareParams = function (p) {
+                p = p || {};
+                var _p = {
+                    events: {}
+                };
+                for (var i in katavorioParams) _p[i] = katavorioParams[i];
+                for (var i in p) _p[i] = p[i];
+                // events
+
+                for (var i = 0; i < _events.length; i++) {
+                    _p.events[_events[i]] = p[_events[i]] || _devNull;
+                }
+                _p.katavorio = this;
+                return _p;
+            }.bind(this),
+            _css = {},
+            overrideCss = katavorioParams.css || {},
+            _scope = katavorioParams.scope || _defaultScope;
+
+        // prepare map of css classes based on defaults frst, then optional overrides
+        for (var i in _classes) _css[i] = _classes[i];
+        for (var i in overrideCss) _css[i] = overrideCss[i];
+
+        var inputFilterSelector = katavorioParams.inputFilterSelector || _defaultInputFilterSelector;
+        /**
+         * Gets the selector identifying which input elements to filter from drag events.
+         * @method getInputFilterSelector
+         * @return {String} Current input filter selector.
+         */
+        this.getInputFilterSelector = function () {
+            return inputFilterSelector;
+        };
+
+        /**
+         * Sets the selector identifying which input elements to filter from drag events.
+         * @method setInputFilterSelector
+         * @param {String} selector Input filter selector to set.
+         * @return {Katavorio} Current instance; method may be chained.
+         */
+        this.setInputFilterSelector = function (selector) {
+            inputFilterSelector = selector;
+            return this;
+        };
+
+        this.draggable = function (el, params) {
+            var o = [];
+            _each(el, function (_el) {
+                _el = _gel(_el);
+                if (_el !== null) {
+                    var p = _prepareParams(params);
+                    _el._katavorioDrag = new Drag(_el, p, _css, _scope);
+                    _reg(_el._katavorioDrag, this._dragsByScope);
+                    o.push(_el._katavorioDrag);
+                    katavorioParams.addClass(_el, _css.draggable);
+                }
+            }.bind(this));
+            return o;
+
+        };
+
+        this.droppable = function (el, params) {
+            var o = [];
+            _each(el, function (_el) {
+                _el = _gel(_el);
+                if (_el !== null) {
+                    _el._katavorioDrop = new Drop(_el, _prepareParams(params), _css, _scope);
+                    _reg(_el._katavorioDrop, this._dropsByScope);
+                    o.push(_el._katavorioDrop);
+                    katavorioParams.addClass(_el, _css.droppable);
+                }
+            }.bind(this));
+            return o;
+        };
+
+        /**
+         * @name Katavorio#select
+         * @function
+         * @desc Adds an element to the current selection (for multiple node drag)
+         * @param {Element|String} DOM element - or id of the element - to add.
+         */
+        this.select = function (el) {
+            _each(el, function () {
+                var _el = _gel(this);
+                if (_el && _el._katavorioDrag) {
+                    if (!_selectionMap[_el._katavorio]) {
+                        _selection.push(_el._katavorioDrag);
+                        _selectionMap[_el._katavorio] = [_el, _selection.length - 1];
+                        katavorioParams.addClass(_el, _css.selected);
+                    }
+                }
+            });
+            return this;
+        };
+
+        /**
+         * @name Katavorio#deselect
+         * @function
+         * @desc Removes an element from the current selection (for multiple node drag)
+         * @param {Element|String} DOM element - or id of the element - to remove.
+         */
+        this.deselect = function (el) {
+            _each(el, function () {
+                var _el = _gel(this);
+                if (_el && _el._katavorio) {
+                    var e = _selectionMap[_el._katavorio];
+                    if (e) {
+                        var _s = [];
+                        for (var i = 0; i < _selection.length; i++)
+                            if (_selection[i].el !== _el) _s.push(_selection[i]);
+                        _selection = _s;
+                        delete _selectionMap[_el._katavorio];
+                        katavorioParams.removeClass(_el, _css.selected);
+                    }
+                }
+            });
+            return this;
+        };
+
+        this.deselectAll = function () {
+            for (var i in _selectionMap) {
+                var d = _selectionMap[i];
+                katavorioParams.removeClass(d[0], _css.selected);
+            }
+
+            _selection.length = 0;
+            _selectionMap = {};
+        };
+
+        this.markSelection = function (drag) {
+            _foreach(_selection, function (e) {
+                e.mark();
+            }, drag);
+        };
+
+        this.unmarkSelection = function (drag, event) {
+            _foreach(_selection, function (e) {
+                e.unmark(event);
+            }, drag);
+        };
+
+        this.getSelection = function () {
+            return _selection.slice(0);
+        };
+
+        this.updateSelection = function (dx, dy, drag) {
+            _foreach(_selection, function (e) {
+                e.moveBy(dx, dy);
+            }, drag);
+        };
+
+        this.notifySelectionDragStop = function (drag, evt) {
+            _foreach(_selection, function (e) {
+                e.stop(evt);
+            }, drag);
+        };
+
+        this.setZoom = function (z) {
+            _zoom = z;
+        };
+        this.getZoom = function () {
+            return _zoom;
+        };
+
+        // does the work of changing scopes
+        var _scopeManip = function (kObj, scopes, map, fn) {
+            if (kObj !== null) {
+                _unreg(kObj, map); // deregister existing scopes
+                kObj[fn](scopes); // set scopes
+                _reg(kObj, map); // register new ones
+            }
+        };
+
+        _each(["set", "add", "remove", "toggle"], function (v) {
+            this[v + "Scope"] = function (el, scopes) {
+                _scopeManip(el._katavorioDrag, scopes, this._dragsByScope, v + "Scope");
+                _scopeManip(el._katavorioDrop, scopes, this._dropsByScope, v + "Scope");
+            }.bind(this);
+            this[v + "DragScope"] = function (el, scopes) {
+                _scopeManip(el._katavorioDrag, scopes, this._dragsByScope, v + "Scope");
+            }.bind(this);
+            this[v + "DropScope"] = function (el, scopes) {
+                _scopeManip(el._katavorioDrop, scopes, this._dropsByScope, v + "Scope");
+            }.bind(this);
+        }.bind(this));
+
+        this.getDragsForScope = function (s) {
+            return this._dragsByScope[s];
+        };
+        this.getDropsForScope = function (s) {
+            return this._dropsByScope[s];
+        };
+
+        var _destroy = function (el, type, map) {
+            el = _gel(el);
+            if (el[type]) {
+                if (_unreg(el[type], map))
+                    el[type].destroy();
+                el[type] = null;
+            }
+        };
+
+        this.elementRemoved = function (el) {
+            this.destroyDraggable(el);
+            this.destroyDroppable(el);
+        };
+
+        this.destroyDraggable = function (el) {
+            _destroy(el, "_katavorioDrag", this._dragsByScope);
+        };
+
+        this.destroyDroppable = function (el) {
+            _destroy(el, "_katavorioDrop", this._dropsByScope);
+        };
+    };
+})(typeof exports !== undefined ? exports : this);
 /*
  * jsPlumb
  *
@@ -2533,15 +4558,18 @@
             return jpc;
         };
 
-        var stTypes = [{
-            el: "source",
-            elId: "sourceId",
-            epDefs: "sourceEndpointDefinitions"
-        }, {
-            el: "target",
-            elId: "targetId",
-            epDefs: "targetEndpointDefinitions"
-        }];
+        var stTypes = [
+            {
+                el: "source",
+                elId: "sourceId",
+                epDefs: "sourceEndpointDefinitions"
+            },
+            {
+                el: "target",
+                elId: "targetId",
+                epDefs: "targetEndpointDefinitions"
+            }
+  ];
 
         var _set = function (c, el, idx, doNotRepaint) {
             var ep, _st = stTypes[idx],
@@ -2695,11 +4723,10 @@
 
             if (conn) {
                 if (forceDetach || global.jsPlumbUtil.functionChain(true, false, [
-                        [conn.endpoints[0], "isDetachAllowed", [conn]],
-                        [conn.endpoints[1], "isDetachAllowed", [conn]],
-                        [conn, "isDetachAllowed", [conn]],
-                        [_currentInstance, "checkCondition", ["beforeDetach", conn]]
-                    ])) {
+                            [conn.endpoints[0], "isDetachAllowed", [conn]],
+                            [conn.endpoints[1], "isDetachAllowed", [conn]],
+                            [conn, "isDetachAllowed", [conn]],
+                            [_currentInstance, "checkCondition", ["beforeDetach", conn]]])) {
 
                     conn.endpoints[0].detach(conn, false, true, fireEvent);
                 }
@@ -2945,14 +4972,12 @@
                     get: _curryGet(list)
                 },
                 setters = ["setHover", "removeAllOverlays", "setLabel", "addClass", "addOverlay", "removeOverlay",
-                    "removeOverlays", "showOverlay", "hideOverlay", "showOverlays", "hideOverlays", "setPaintStyle",
-                    "setHoverPaintStyle", "setSuspendEvents", "setParameter", "setParameters", "setVisible",
-                    "repaint", "addType", "toggleType", "removeType", "removeClass", "setType", "bind", "unbind"
-                ],
+                           "removeOverlays", "showOverlay", "hideOverlay", "showOverlays", "hideOverlays", "setPaintStyle",
+                           "setHoverPaintStyle", "setSuspendEvents", "setParameter", "setParameters", "setVisible",
+                           "repaint", "addType", "toggleType", "removeType", "removeClass", "setType", "bind", "unbind"],
 
                 getters = ["getLabel", "getOverlay", "isHover", "getParameter", "getParameters", "getPaintStyle",
-                    "getHoverPaintStyle", "isVisible", "hasType", "getType", "isSuspendEvents"
-                ],
+                           "getHoverPaintStyle", "isVisible", "hasType", "getType", "isSuspendEvents"],
                 i, ii;
 
             for (i = 0, ii = setters.length; i < ii; i++)
@@ -3923,7 +5948,7 @@
                 for (var i = 0, ii = el.length; i < ii; i++) {
                     _draw(el[i], ui, timestamp);
                 } else // ...and single strings.
-                    _draw(el, ui, timestamp);
+                _draw(el, ui, timestamp);
 
             return _currentInstance;
         };
@@ -4314,8 +6339,7 @@
     };
 
     var typeParameters = ["connectorStyle", "connectorHoverStyle", "connectorOverlays",
-        "connector", "connectionType", "connectorClass", "connectorHoverClass"
-    ];
+                "connector", "connectionType", "connectorClass", "connectorHoverClass"];
 
     // a helper function that tries to find a connection to the given element, and returns it if so. if elementWithPrecedence is null,
     // or no connection to it is found, we return the first connection in our list.
@@ -6191,9 +8215,7 @@
                 endpoint = conn.endpoints[idx],
                 endpointId = endpoint.id,
                 oIdx = [1, 0][idx],
-                values = [
-                    [theta, order], conn, aBoolean, otherElId, endpointId
-                ],
+                values = [[theta, order], conn, aBoolean, otherElId, endpointId],
                 listToAddTo = lists[edgeId],
                 listToRemoveFrom = endpoint._continuousAnchorEdge ? lists[endpoint._continuousAnchorEdge] : null,
                 i;
@@ -6766,8 +8788,7 @@
                 // anchor: if it declares zero for some direction, we declare zero too. this might not be the most awesome. perhaps we can come
                 // up with a better way. it's just so that the line we draw looks like it makes sense. maybe this wont make sense.
                 return [Math.abs(o[0]) * xDir * -1,
-                    Math.abs(o[1]) * yDir * -1
-                ];
+                        Math.abs(o[1]) * yDir * -1];
             }
         };
 
@@ -7061,11 +9082,8 @@
             },
             _rectangle = function () {
                 return _shape([
-                    [0, 0, 1, 0],
-                    [1, 0, 1, 1],
-                    [1, 1, 0, 1],
-                    [0, 1, 0, 0]
-                ]);
+     [0, 0, 1, 0], [1, 0, 1, 1], [1, 1, 0, 1], [0, 1, 0, 0]
+    ]);
             };
 
         var _shapes = {
@@ -7073,20 +9091,15 @@
                 "Ellipse": _circle,
                 "Diamond": function () {
                     return _shape([
-                        [0.5, 0, 1, 0.5],
-                        [1, 0.5, 0.5, 1],
-                        [0.5, 1, 0, 0.5],
-                        [0, 0.5, 0.5, 0]
-                    ]);
+      [0.5, 0, 1, 0.5], [1, 0.5, 0.5, 1], [0.5, 1, 0, 0.5], [0, 0.5, 0.5, 0]
+    ]);
                 },
                 "Rectangle": _rectangle,
                 "Square": _rectangle,
                 "Triangle": function () {
                     return _shape([
-                        [0.5, 0, 1, 1],
-                        [1, 1, 0, 1],
-                        [0, 1, 0.5, 0]
-                    ]);
+      [0.5, 0, 1, 1], [1, 1, 0, 1], [0, 1, 0.5, 0]
+    ]);
                 },
                 "Path": function (params) {
                     var points = params.points,
@@ -7111,11 +9124,11 @@
                         _y = points[i][1] - 0.5;
 
                     o.push([
-                        0.5 + ((_x * Math.cos(theta)) - (_y * Math.sin(theta))),
-                        0.5 + ((_x * Math.sin(theta)) + (_y * Math.cos(theta))),
-                        points[i][2],
-                        points[i][3]
-                    ]);
+                    0.5 + ((_x * Math.cos(theta)) - (_y * Math.sin(theta))),
+                    0.5 + ((_x * Math.sin(theta)) + (_y * Math.cos(theta))),
+                    points[i][2],
+                    points[i][3]
+                ]);
                 }
                 return o;
             };
@@ -7524,19 +9537,24 @@
         },
 
         Bezier: function (params) {
-            this.curve = [{
-                x: params.x1,
-                y: params.y1
-            }, {
-                x: params.cp1x,
-                y: params.cp1y
-            }, {
-                x: params.cp2x,
-                y: params.cp2y
-            }, {
-                x: params.x2,
-                y: params.y2
-            }];
+            this.curve = [
+                {
+                    x: params.x1,
+                    y: params.y1
+                },
+                {
+                    x: params.cp1x,
+                    y: params.cp1y
+                },
+                {
+                    x: params.cp2x,
+                    y: params.cp2y
+                },
+                {
+                    x: params.x2,
+                    y: params.y2
+                }
+            ];
 
             var _super = global.jsPlumb.Segments.AbstractSegment.apply(this, arguments);
             // although this is not a strictly rigorous determination of bounds
@@ -8058,8 +10076,7 @@
         this._compute = function (anchorPoint, orientation, endpointStyle, connectorPaintStyle) {
             this.anchorPoint = anchorPoint;
             if (this._jsPlumb.ready) return [anchorPoint[0] - this._jsPlumb.widthToUse / 2, anchorPoint[1] - this._jsPlumb.heightToUse / 2,
-                this._jsPlumb.widthToUse, this._jsPlumb.heightToUse
-            ];
+         this._jsPlumb.widthToUse, this._jsPlumb.heightToUse];
             else return [0, 0, 0, 0];
         };
 
@@ -8722,4 +10739,1372 @@
             this.getEventManager().off.apply(this, arguments);
         }
     });
+})(typeof exports !== undefined ? exports : this);
+/*
+ * jsPlumb
+ *
+ * Title:jsPlumb 1.7.2
+ *
+ * Provides a way to visually connect elements on an HTML page, using SVG or VML.
+ *
+ * This file contains the 'flowchart' connectors, consisting of vertical and horizontal line segments.
+ *
+ * Copyright (c) 2010 - 2014 Simon Porritt (simon@jsplumbtoolkit.com)
+ *
+ * http://jsplumbtoolkit.com
+ * http://github.com/sporritt/jsplumb
+ *
+ * Dual licensed under the MIT and GPL2 licenses.
+ */
+;
+(function (global) {
+
+    "use strict";
+
+    /**
+     * Function: Constructor
+     * 
+     * Parameters:
+     * 	stub - minimum length for the stub at each end of the connector. This can be an integer, giving a value for both ends of the connections, 
+     * or an array of two integers, giving separate values for each end. The default is an integer with value 30 (pixels). 
+     *  gap  - gap to leave between the end of the connector and the element on which the endpoint resides. if you make this larger than stub then you will see some odd looking behaviour.  
+                Like stub, this can be an array or a single value. defaults to 0 pixels for each end.     
+     * cornerRadius - optional, defines the radius of corners between segments. defaults to 0 (hard edged corners).
+     * alwaysRespectStubs - defaults to false. whether or not the connectors should always draw the stub, or, if the two elements
+                            are in close proximity to each other (closer than the sum of the two stubs), to adjust the stubs.
+     */
+    var Flowchart = function (params) {
+        this.type = "Flowchart";
+        params = params || {};
+        params.stub = params.stub === null ? 30 : params.stub;
+        var self = this,
+            _super = global.jsPlumb.Connectors.AbstractConnector.apply(this, arguments),
+            midpoint = params.midpoint === null ? 0.5 : params.midpoint,
+            points = [],
+            segments = [],
+            grid = params.grid,
+            alwaysRespectStubs = params.alwaysRespectStubs,
+            userSuppliedSegments = null,
+            lastx = null,
+            lasty = null,
+            lastOrientation,
+            cornerRadius = params.cornerRadius !== null ? params.cornerRadius : 0,
+            sgn = function (n) {
+                return n < 0 ? -1 : n === 0 ? 0 : 1;
+            },
+            /**
+             * helper method to add a segment.
+             */
+            addSegment = function (segments, x, y, paintInfo) {
+                if (lastx == x && lasty == y) return;
+                var lx = lastx === null ? paintInfo.sx : lastx,
+                    ly = lasty === null ? paintInfo.sy : lasty,
+                    o = lx == x ? "v" : "h",
+                    sgnx = sgn(x - lx),
+                    sgny = sgn(y - ly);
+
+                lastx = x;
+                lasty = y;
+                segments.push([lx, ly, x, y, o, sgnx, sgny]);
+            },
+            segLength = function (s) {
+                return Math.sqrt(Math.pow(s[0] - s[2], 2) + Math.pow(s[1] - s[3], 2));
+            },
+            _cloneArray = function (a) {
+                var _a = [];
+                _a.push.apply(_a, a);
+                return _a;
+            },
+            updateMinMax = function (a1) {
+                self.bounds.minX = Math.min(self.bounds.minX, a1[2]);
+                self.bounds.maxX = Math.max(self.bounds.maxX, a1[2]);
+                self.bounds.minY = Math.min(self.bounds.minY, a1[3]);
+                self.bounds.maxY = Math.max(self.bounds.maxY, a1[3]);
+            },
+            writeSegments = function (conn, segments, paintInfo) {
+                var current, next;
+                for (var i = 0; i < segments.length - 1; i++) {
+
+                    current = current || _cloneArray(segments[i]);
+                    next = _cloneArray(segments[i + 1]);
+                    if (cornerRadius > 0 && current[4] != next[4]) {
+                        var radiusToUse = Math.min(cornerRadius, segLength(current), segLength(next));
+                        // right angle. adjust current segment's end point, and next segment's start point.
+                        current[2] -= current[5] * radiusToUse;
+                        current[3] -= current[6] * radiusToUse;
+                        next[0] += next[5] * radiusToUse;
+                        next[1] += next[6] * radiusToUse;
+                        var ac = (current[6] == next[5] && next[5] == 1) ||
+                            ((current[6] == next[5] && next[5] === 0) && current[5] != next[6]) ||
+                            (current[6] == next[5] && next[5] == -1),
+                            sgny = next[1] > current[3] ? 1 : -1,
+                            sgnx = next[0] > current[2] ? 1 : -1,
+                            sgnEqual = sgny == sgnx,
+                            cx = (sgnEqual && ac || (!sgnEqual && !ac)) ? next[0] : current[2],
+                            cy = (sgnEqual && ac || (!sgnEqual && !ac)) ? current[3] : next[1];
+
+                        _super.addSegment(conn, "Straight", {
+                            x1: current[0],
+                            y1: current[1],
+                            x2: current[2],
+                            y2: current[3]
+                        });
+
+                        _super.addSegment(conn, "Arc", {
+                            r: radiusToUse,
+                            x1: current[2],
+                            y1: current[3],
+                            x2: next[0],
+                            y2: next[1],
+                            cx: cx,
+                            cy: cy,
+                            ac: ac
+                        });
+                    } else {
+                        // dx + dy are used to adjust for line width.
+                        var dx = (current[2] == current[0]) ? 0 : (current[2] > current[0]) ? (paintInfo.lw / 2) : -(paintInfo.lw / 2),
+                            dy = (current[3] == current[1]) ? 0 : (current[3] > current[1]) ? (paintInfo.lw / 2) : -(paintInfo.lw / 2);
+                        _super.addSegment(conn, "Straight", {
+                            x1: current[0] - dx,
+                            y1: current[1] - dy,
+                            x2: current[2] + dx,
+                            y2: current[3] + dy
+                        });
+                    }
+                    current = next;
+                }
+                if (next !== null) {
+                    // last segment
+                    _super.addSegment(conn, "Straight", {
+                        x1: next[0],
+                        y1: next[1],
+                        x2: next[2],
+                        y2: next[3]
+                    });
+                }
+            };
+
+        this.setSegments = function (s) {
+            userSuppliedSegments = s;
+        };
+
+        this.isEditable = function () {
+            return true;
+        };
+
+        /*
+            Function: getOriginalSegments
+            Gets the segments before the addition of rounded corners. This is used by the flowchart
+            connector editor, since it only wants to concern itself with the original segments.
+        */
+        this.getOriginalSegments = function () {
+            return userSuppliedSegments || segments;
+        };
+
+        this._compute = function (paintInfo, params) {
+
+            if (params.clearEdits)
+                userSuppliedSegments = null;
+
+            if (userSuppliedSegments !== null) {
+                writeSegments(this, userSuppliedSegments, paintInfo);
+                return;
+            }
+
+            segments = [];
+            lastx = null;
+            lasty = null;
+            lastOrientation = null;
+
+            var midx = paintInfo.startStubX + ((paintInfo.endStubX - paintInfo.startStubX) * midpoint),
+                midy = paintInfo.startStubY + ((paintInfo.endStubY - paintInfo.startStubY) * midpoint);
+
+            var findClearedLine = function (start, mult, anchorPos, dimension) {
+                    return start + (mult * ((1 - anchorPos) * dimension) + _super.maxStub);
+                },
+                orientations = {
+                    x: [0, 1],
+                    y: [1, 0]
+                },
+                commonStubCalculator = function (axis) {
+                    return [paintInfo.startStubX, paintInfo.startStubY, paintInfo.endStubX, paintInfo.endStubY];
+                },
+                stubCalculators = {
+                    perpendicular: commonStubCalculator,
+                    orthogonal: commonStubCalculator,
+                    opposite: function (axis) {
+                        var pi = paintInfo,
+                            idx = axis == "x" ? 0 : 1,
+                            areInProximity = {
+                                "x": function () {
+                                    return ((pi.so[idx] == 1 && (
+                                            ((pi.startStubX > pi.endStubX) && (pi.tx > pi.startStubX)) ||
+                                            ((pi.sx > pi.endStubX) && (pi.tx > pi.sx))))) ||
+
+                                        ((pi.so[idx] == -1 && (
+                                            ((pi.startStubX < pi.endStubX) && (pi.tx < pi.startStubX)) ||
+                                            ((pi.sx < pi.endStubX) && (pi.tx < pi.sx)))));
+                                },
+                                "y": function () {
+                                    return ((pi.so[idx] == 1 && (
+                                            ((pi.startStubY > pi.endStubY) && (pi.ty > pi.startStubY)) ||
+                                            ((pi.sy > pi.endStubY) && (pi.ty > pi.sy))))) ||
+
+                                        ((pi.so[idx] == -1 && (
+                                            ((pi.startStubY < pi.endStubY) && (pi.ty < pi.startStubY)) ||
+                                            ((pi.sy < pi.endStubY) && (pi.ty < pi.sy)))));
+                                }
+                            };
+
+                        if (!alwaysRespectStubs && areInProximity[axis]()) {
+                            return {
+                                "x": [(paintInfo.sx + paintInfo.tx) / 2, paintInfo.startStubY, (paintInfo.sx + paintInfo.tx) / 2, paintInfo.endStubY],
+                                "y": [paintInfo.startStubX, (paintInfo.sy + paintInfo.ty) / 2, paintInfo.endStubX, (paintInfo.sy + paintInfo.ty) / 2]
+                            }[axis];
+                        } else {
+                            return [paintInfo.startStubX, paintInfo.startStubY, paintInfo.endStubX, paintInfo.endStubY];
+                        }
+                    }
+                },
+                lineCalculators = {
+                    perpendicular: function (axis, ss, oss, es, oes) {
+                        var pi = paintInfo,
+                            sis = {
+                                x: [[[1, 2, 3, 4], null, [2, 1, 4, 3]], null, [[4, 3, 2, 1], null, [3, 4, 1, 2]]],
+                                y: [[[3, 2, 1, 4], null, [2, 3, 4, 1]], null, [[4, 1, 2, 3], null, [1, 4, 3, 2]]]
+                            },
+                            stubs = {
+                                x: [[pi.startStubX, pi.endStubX], null, [pi.endStubX, pi.startStubX]],
+                                y: [[pi.startStubY, pi.endStubY], null, [pi.endStubY, pi.startStubY]]
+                            },
+                            midLines = {
+                                x: [[midx, pi.startStubY], [midx, pi.endStubY]],
+                                y: [[pi.startStubX, midy], [pi.endStubX, midy]]
+                            },
+                            linesToEnd = {
+                                x: [[pi.endStubX, pi.startStubY]],
+                                y: [[pi.startStubX, pi.endStubY]]
+                            },
+                            startToEnd = {
+                                x: [[pi.startStubX, pi.endStubY], [pi.endStubX, pi.endStubY]],
+                                y: [[pi.endStubX, pi.startStubY], [pi.endStubX, pi.endStubY]]
+                            },
+                            startToMidToEnd = {
+                                x: [[pi.startStubX, midy], [pi.endStubX, midy], [pi.endStubX, pi.endStubY]],
+                                y: [[midx, pi.startStubY], [midx, pi.endStubY], [pi.endStubX, pi.endStubY]]
+                            },
+                            otherStubs = {
+                                x: [pi.startStubY, pi.endStubY],
+                                y: [pi.startStubX, pi.endStubX]
+                            },
+                            soIdx = orientations[axis][0],
+                            toIdx = orientations[axis][1],
+                            _so = pi.so[soIdx] + 1,
+                            _to = pi.to[toIdx] + 1,
+                            otherFlipped = (pi.to[toIdx] == -1 && (otherStubs[axis][1] < otherStubs[axis][0])) || (pi.to[toIdx] == 1 && (otherStubs[axis][1] > otherStubs[axis][0])),
+                            stub1 = stubs[axis][_so][0],
+                            stub2 = stubs[axis][_so][1],
+                            segmentIndexes = sis[axis][_so][_to];
+
+                        if (pi.segment == segmentIndexes[3] || (pi.segment == segmentIndexes[2] && otherFlipped)) {
+                            return midLines[axis];
+                        } else if (pi.segment == segmentIndexes[2] && stub2 < stub1) {
+                            return linesToEnd[axis];
+                        } else if ((pi.segment == segmentIndexes[2] && stub2 >= stub1) || (pi.segment == segmentIndexes[1] && !otherFlipped)) {
+                            return startToMidToEnd[axis];
+                        } else if (pi.segment == segmentIndexes[0] || (pi.segment == segmentIndexes[1] && otherFlipped)) {
+                            return startToEnd[axis];
+                        }
+                    },
+                    orthogonal: function (axis, startStub, otherStartStub, endStub, otherEndStub) {
+                        var pi = paintInfo,
+                            extent = {
+                                "x": pi.so[0] == -1 ? Math.min(startStub, endStub) : Math.max(startStub, endStub),
+                                "y": pi.so[1] == -1 ? Math.min(startStub, endStub) : Math.max(startStub, endStub)
+                            }[axis];
+
+                        return {
+                            "x": [[extent, otherStartStub], [extent, otherEndStub], [endStub, otherEndStub]],
+                            "y": [[otherStartStub, extent], [otherEndStub, extent], [otherEndStub, endStub]]
+                        }[axis];
+                    },
+                    opposite: function (axis, ss, oss, es, oes) {
+                        var pi = paintInfo,
+                            otherAxis = {
+                                "x": "y",
+                                "y": "x"
+                            }[axis],
+                            dim = {
+                                "x": "height",
+                                "y": "width"
+                            }[axis],
+                            comparator = pi["is" + axis.toUpperCase() + "GreaterThanStubTimes2"];
+
+                        if (params.sourceEndpoint.elementId == params.targetEndpoint.elementId) {
+                            var _val = oss + ((1 - params.sourceEndpoint.anchor[otherAxis]) * params.sourceInfo[dim]) + _super.maxStub;
+                            return {
+                                "x": [[ss, _val], [es, _val]],
+                                "y": [[_val, ss], [_val, es]]
+                            }[axis];
+
+                        } else if (!comparator || (pi.so[idx] == 1 && ss > es) || (pi.so[idx] == -1 && ss < es)) {
+                            return {
+                                "x": [[ss, midy], [es, midy]],
+                                "y": [[midx, ss], [midx, es]]
+                            }[axis];
+                        } else if ((pi.so[idx] == 1 && ss < es) || (pi.so[idx] == -1 && ss > es)) {
+                            return {
+                                "x": [[midx, pi.sy], [midx, pi.ty]],
+                                "y": [[pi.sx, midy], [pi.tx, midy]]
+                            }[axis];
+                        }
+                    }
+                };
+
+            var stubs = stubCalculators[paintInfo.anchorOrientation](paintInfo.sourceAxis),
+                idx = paintInfo.sourceAxis == "x" ? 0 : 1,
+                oidx = paintInfo.sourceAxis == "x" ? 1 : 0,
+                ss = stubs[idx],
+                oss = stubs[oidx],
+                es = stubs[idx + 2],
+                oes = stubs[oidx + 2];
+
+            // add the start stub segment.
+            addSegment(segments, stubs[0], stubs[1], paintInfo);
+
+            // compute the rest of the line
+            var p = lineCalculators[paintInfo.anchorOrientation](paintInfo.sourceAxis, ss, oss, es, oes);
+            if (p) {
+                for (var i = 0; i < p.length; i++) {
+                    addSegment(segments, p[i][0], p[i][1], paintInfo);
+                }
+            }
+
+            // line to end stub
+            addSegment(segments, stubs[2], stubs[3], paintInfo);
+
+            // end stub to end
+            addSegment(segments, paintInfo.tx, paintInfo.ty, paintInfo);
+
+            writeSegments(this, segments, paintInfo);
+        };
+
+        this.getPath = function () {
+            var _last = null,
+                _lastAxis = null,
+                s = [],
+                segs = userSuppliedSegments || segments;
+            for (var i = 0; i < segs.length; i++) {
+                var seg = segs[i],
+                    axis = seg[4],
+                    axisIndex = (axis == "v" ? 3 : 2);
+                if (_last !== null && _lastAxis === axis) {
+                    _last[axisIndex] = seg[axisIndex];
+                } else {
+                    if (seg[0] != seg[2] || seg[1] != seg[3]) {
+                        s.push({
+                            start: [seg[0], seg[1]],
+                            end: [seg[2], seg[3]]
+                        });
+                        _last = seg;
+                        _lastAxis = seg[4];
+                    }
+                }
+            }
+            return s;
+        };
+
+        this.setPath = function (path) {
+            userSuppliedSegments = [];
+            for (var i = 0; i < path.length; i++) {
+                var lx = path[i].start[0],
+                    ly = path[i].start[1],
+                    x = path[i].end[0],
+                    y = path[i].end[1],
+                    o = lx == x ? "v" : "h",
+                    sgnx = sgn(x - lx),
+                    sgny = sgn(y - ly);
+
+                userSuppliedSegments.push([lx, ly, x, y, o, sgnx, sgny]);
+            }
+        };
+    };
+
+    global.jsPlumbUtil.extend(Flowchart, global.jsPlumb.Connectors.AbstractConnector);
+    global.jsPlumb.registerConnectorType(Flowchart, "Flowchart");
+})(typeof exports !== undefined ? exports : this);
+/*
+ * jsPlumb
+ *
+ * Title:jsPlumb 1.7.2
+ *
+ * Provides a way to visually connect elements on an HTML page, using SVG or VML.
+ *
+ * This file contains the state machine connectors.
+ *
+ * Copyright (c) 2010 - 2014 Simon Porritt (simon@jsplumbtoolkit.com)
+ *
+ * http://jsplumbtoolkit.com
+ * http://github.com/sporritt/jsplumb
+ *
+ * Dual licensed under the MIT and GPL2 licenses.
+ */
+;
+(function (global) {
+
+    "use strict";
+
+    var Line = function (x1, y1, x2, y2) {
+
+            this.m = (y2 - y1) / (x2 - x1);
+            this.b = -1 * ((this.m * x1) - y1);
+
+            this.rectIntersect = function (x, y, w, h) {
+                var results = [],
+                    xInt, yInt;
+
+                // 	try top face
+                // 	the equation of the top face is y = (0 * x) + b; y = b.
+                xInt = (y - this.b) / this.m;
+                // test that the X value is in the line's range.
+                if (xInt >= x && xInt <= (x + w)) results.push([xInt, (this.m * xInt) + this.b]);
+
+                // try right face
+                yInt = (this.m * (x + w)) + this.b;
+                if (yInt >= y && yInt <= (y + h)) results.push([(yInt - this.b) / this.m, yInt]);
+
+                // 	bottom face
+                xInt = ((y + h) - this.b) / this.m;
+                // test that the X value is in the line's range.
+                if (xInt >= x && xInt <= (x + w)) results.push([xInt, (this.m * xInt) + this.b]);
+
+                // try left face
+                yInt = (this.m * x) + this.b;
+                if (yInt >= y && yInt <= (y + h)) results.push([(yInt - this.b) / this.m, yInt]);
+
+                if (results.length == 2) {
+                    var midx = (results[0][0] + results[1][0]) / 2,
+                        midy = (results[0][1] + results[1][1]) / 2;
+                    results.push([midx, midy]);
+                    // now calculate the segment inside the rectangle where the midpoint lies.
+                    var xseg = midx <= x + (w / 2) ? -1 : 1,
+                        yseg = midy <= y + (h / 2) ? -1 : 1;
+                    results.push([xseg, yseg]);
+                    return results;
+                }
+
+                return null;
+
+            };
+        },
+        _segment = function (x1, y1, x2, y2) {
+            if (x1 <= x2 && y2 <= y1) return 1;
+            else if (x1 <= x2 && y1 <= y2) return 2;
+            else if (x2 <= x1 && y2 >= y1) return 3;
+            return 4;
+        },
+
+        // the control point we will use depends on the faces to which each end of the connection is assigned, specifically whether or not the
+        // two faces are parallel or perpendicular.  if they are parallel then the control point lies on the midpoint of the axis in which they
+        // are parellel and varies only in the other axis; this variation is proportional to the distance that the anchor points lie from the
+        // center of that face.  if the two faces are perpendicular then the control point is at some distance from both the midpoints; the amount and
+        // direction are dependent on the orientation of the two elements. 'seg', passed in to this method, tells you which segment the target element
+        // lies in with respect to the source: 1 is top right, 2 is bottom right, 3 is bottom left, 4 is top left.
+        //
+        // sourcePos and targetPos are arrays of info about where on the source and target each anchor is located.  their contents are:
+        //
+        // 0 - absolute x
+        // 1 - absolute y
+        // 2 - proportional x in element (0 is left edge, 1 is right edge)
+        // 3 - proportional y in element (0 is top edge, 1 is bottom edge)
+        // 	
+        _findControlPoint = function (midx, midy, segment, sourceEdge, targetEdge, dx, dy, distance, proximityLimit) {
+            // TODO (maybe)
+            // - if anchor pos is 0.5, make the control point take into account the relative position of the elements.
+            if (distance <= proximityLimit) return [midx, midy];
+
+            if (segment === 1) {
+                if (sourceEdge[3] <= 0 && targetEdge[3] >= 1) return [midx + (sourceEdge[2] < 0.5 ? -1 * dx : dx), midy];
+                else if (sourceEdge[2] >= 1 && targetEdge[2] <= 0) return [midx, midy + (sourceEdge[3] < 0.5 ? -1 * dy : dy)];
+                else return [midx + (-1 * dx), midy + (-1 * dy)];
+            } else if (segment === 2) {
+                if (sourceEdge[3] >= 1 && targetEdge[3] <= 0) return [midx + (sourceEdge[2] < 0.5 ? -1 * dx : dx), midy];
+                else if (sourceEdge[2] >= 1 && targetEdge[2] <= 0) return [midx, midy + (sourceEdge[3] < 0.5 ? -1 * dy : dy)];
+                else return [midx + (1 * dx), midy + (-1 * dy)];
+            } else if (segment === 3) {
+                if (sourceEdge[3] >= 1 && targetEdge[3] <= 0) return [midx + (sourceEdge[2] < 0.5 ? -1 * dx : dx), midy];
+                else if (sourceEdge[2] <= 0 && targetEdge[2] >= 1) return [midx, midy + (sourceEdge[3] < 0.5 ? -1 * dy : dy)];
+                else return [midx + (-1 * dx), midy + (-1 * dy)];
+            } else if (segment === 4) {
+                if (sourceEdge[3] <= 0 && targetEdge[3] >= 1) return [midx + (sourceEdge[2] < 0.5 ? -1 * dx : dx), midy];
+                else if (sourceEdge[2] <= 0 && targetEdge[2] >= 1) return [midx, midy + (sourceEdge[3] < 0.5 ? -1 * dy : dy)];
+                else return [midx + (1 * dx), midy + (-1 * dy)];
+            }
+
+        };
+
+    /**
+     * Class: Connectors.StateMachine
+     * Provides 'state machine' connectors.
+     */
+    /*
+     * Function: Constructor
+     *
+     * Parameters:
+     * curviness -	measure of how "curvy" the connectors will be.  this is translated as the distance that the
+     *                Bezier curve's control point is from the midpoint of the straight line connecting the two
+     *              endpoints, and does not mean that the connector is this wide.  The Bezier curve never reaches
+     *              its control points; they act as gravitational masses. defaults to 10.
+     * margin	-	distance from element to start and end connectors, in pixels.  defaults to 5.
+     * proximityLimit  -   sets the distance beneath which the elements are consider too close together to bother
+     *						with fancy curves. by default this is 80 pixels.
+     * loopbackRadius	-	the radius of a loopback connector.  optional; defaults to 25.
+     * showLoopback   -   If set to false this tells the connector that it is ok to paint connections whose source and target is the same element with a connector running through the element. The default value for this is true; the connector always makes a loopback connection loop around the element rather than passing through it.
+     */
+    var StateMachine = function (params) {
+        params = params || {};
+        this.type = "StateMachine";
+
+        var self = this,
+            _super = global.jsPlumb.Connectors.AbstractConnector.apply(this, arguments),
+            curviness = params.curviness || 10,
+            margin = params.margin || 5,
+            proximityLimit = params.proximityLimit || 80,
+            clockwise = params.orientation && params.orientation === "clockwise",
+            loopbackRadius = params.loopbackRadius || 25,
+            showLoopback = params.showLoopback !== false;
+
+        this._compute = function (paintInfo, params) {
+            var w = Math.abs(params.sourcePos[0] - params.targetPos[0]),
+                h = Math.abs(params.sourcePos[1] - params.targetPos[1]),
+                x = Math.min(params.sourcePos[0], params.targetPos[0]),
+                y = Math.min(params.sourcePos[1], params.targetPos[1]);
+
+            if (!showLoopback || (params.sourceEndpoint.elementId !== params.targetEndpoint.elementId)) {
+                var _sx = params.sourcePos[0] < params.targetPos[0] ? 0 : w,
+                    _sy = params.sourcePos[1] < params.targetPos[1] ? 0 : h,
+                    _tx = params.sourcePos[0] < params.targetPos[0] ? w : 0,
+                    _ty = params.sourcePos[1] < params.targetPos[1] ? h : 0;
+
+                // now adjust for the margin
+                if (params.sourcePos[2] === 0) _sx -= margin;
+                if (params.sourcePos[2] === 1) _sx += margin;
+                if (params.sourcePos[3] === 0) _sy -= margin;
+                if (params.sourcePos[3] === 1) _sy += margin;
+                if (params.targetPos[2] === 0) _tx -= margin;
+                if (params.targetPos[2] === 1) _tx += margin;
+                if (params.targetPos[3] === 0) _ty -= margin;
+                if (params.targetPos[3] === 1) _ty += margin;
+
+                //
+                // these connectors are quadratic bezier curves, having a single control point. if both anchors 
+                // are located at 0.5 on their respective faces, the control point is set to the midpoint and you
+                // get a straight line.  this is also the case if the two anchors are within 'proximityLimit', since
+                // it seems to make good aesthetic sense to do that. outside of that, the control point is positioned 
+                // at 'curviness' pixels away along the normal to the straight line connecting the two anchors.
+                // 
+                // there may be two improvements to this.  firstly, we might actually support the notion of avoiding nodes
+                // in the UI, or at least making a good effort at doing so.  if a connection would pass underneath some node,
+                // for example, we might increase the distance the control point is away from the midpoint in a bid to
+                // steer it around that node.  this will work within limits, but i think those limits would also be the likely
+                // limits for, once again, aesthetic good sense in the layout of a chart using these connectors.
+                //
+                // the second possible change is actually two possible changes: firstly, it is possible we should gradually
+                // decrease the 'curviness' as the distance between the anchors decreases; start tailing it off to 0 at some
+                // point (which should be configurable).  secondly, we might slightly increase the 'curviness' for connectors
+                // with respect to how far their anchor is from the center of its respective face. this could either look cool,
+                // or stupid, and may indeed work only in a way that is so subtle as to have been a waste of time.
+                //
+
+                var _midx = (_sx + _tx) / 2,
+                    _midy = (_sy + _ty) / 2,
+                    m2 = (-1 * _midx) / _midy,
+                    theta2 = Math.atan(m2),
+                    dy = (m2 == Infinity || m2 == -Infinity) ? 0 : Math.abs(curviness / 2 * Math.sin(theta2)),
+                    dx = (m2 == Infinity || m2 == -Infinity) ? 0 : Math.abs(curviness / 2 * Math.cos(theta2)),
+                    segment = _segment(_sx, _sy, _tx, _ty),
+                    distance = Math.sqrt(Math.pow(_tx - _sx, 2) + Math.pow(_ty - _sy, 2)),
+                    // calculate the control point.  this code will be where we'll put in a rudimentary element avoidance scheme; it
+                    // will work by extending the control point to force the curve to be, um, curvier.
+                    _controlPoint = _findControlPoint(_midx,
+                        _midy,
+                        segment,
+                        params.sourcePos,
+                        params.targetPos,
+                        curviness, curviness,
+                        distance,
+                        proximityLimit);
+
+                _super.addSegment(this, "Bezier", {
+                    x1: _tx,
+                    y1: _ty,
+                    x2: _sx,
+                    y2: _sy,
+                    cp1x: _controlPoint[0],
+                    cp1y: _controlPoint[1],
+                    cp2x: _controlPoint[0],
+                    cp2y: _controlPoint[1]
+                });
+            } else {
+                // a loopback connector.  draw an arc from one anchor to the other.            	
+                var x1 = params.sourcePos[0],
+                    x2 = params.sourcePos[0],
+                    y1 = params.sourcePos[1] - margin,
+                    y2 = params.sourcePos[1] - margin,
+                    cx = x1,
+                    cy = y1 - loopbackRadius,
+                    // canvas sizing stuff, to ensure the whole painted area is visible.
+                    _w = 2 * loopbackRadius,
+                    _h = 2 * loopbackRadius,
+                    _x = cx - loopbackRadius,
+                    _y = cy - loopbackRadius;
+
+                paintInfo.points[0] = _x;
+                paintInfo.points[1] = _y;
+                paintInfo.points[2] = _w;
+                paintInfo.points[3] = _h;
+
+                // ADD AN ARC SEGMENT.
+                _super.addSegment(this, "Arc", {
+                    loopback: true,
+                    x1: (x1 - _x) + 4,
+                    y1: y1 - _y,
+                    startAngle: 0,
+                    endAngle: 2 * Math.PI,
+                    r: loopbackRadius,
+                    ac: !clockwise,
+                    x2: (x1 - _x) - 4,
+                    y2: y1 - _y,
+                    cx: cx - _x,
+                    cy: cy - _y
+                });
+            }
+        };
+    };
+    global.jsPlumb.registerConnectorType(StateMachine, "StateMachine");
+})(typeof exports !== undefined ? exports : this);
+
+/*
+    	// a possible rudimentary avoidance scheme, old now, perhaps not useful.
+        //      if (avoidSelector) {
+		//		    var testLine = new Line(sourcePos[0] + _sx,sourcePos[1] + _sy,sourcePos[0] + _tx,sourcePos[1] + _ty);
+		//		    var sel = global.jsPlumb.getSelector(avoidSelector);
+		//		    for (var i = 0; i < sel.length; i++) {
+		//			    var id = global.jsPlumb.getId(sel[i]);
+		//			    if (id != sourceEndpoint.elementId && id != targetEndpoint.elementId) {
+		//				    o = global.jsPlumb.getOffset(id), s = global.jsPlumb.getSize(id);
+//
+//						    if (o && s) {
+//							    var collision = testLine.rectIntersect(o.left,o.top,s[0],s[1]);
+//							    if (collision) {
+								    // set the control point to be a certain distance from the midpoint of the two points that
+								    // the line crosses on the rectangle.
+								    // TODO where will this 75 number come from?
+					//			    _controlX = collision[2][0] + (75 * collision[3][0]);
+				//	/			    _controlY = collision[2][1] + (75 * collision[3][1]);
+//							    }
+//						    }
+					//  }
+	//			    }
+              //}
+    */
+/*
+ * jsPlumb
+ *
+ * Title:jsPlumb 1.7.2
+ *
+ * Provides a way to visually connect elements on an HTML page, using SVG or VML.
+ *
+ * This file contains the code for the Bezier connector type.
+ *
+ * Copyright (c) 2010 - 2014 Simon Porritt (simon@jsplumbtoolkit.com)
+ *
+ * http://jsplumbtoolkit.com
+ * http://github.com/sporritt/jsplumb
+ *
+ * Dual licensed under the MIT and GPL2 licenses.
+ */
+;
+(function (global) {
+
+    var Bezier = function (params) {
+        params = params || {};
+
+        var _super = global.jsPlumb.Connectors.AbstractConnector.apply(this, arguments),
+            stub = params.stub || 50,
+            majorAnchor = params.curviness || 150,
+            minorAnchor = 10;
+
+        this.type = "Bezier";
+        this.getCurviness = function () {
+            return majorAnchor;
+        };
+
+        this._findControlPoint = function (point, sourceAnchorPosition, targetAnchorPosition, sourceEndpoint, targetEndpoint) {
+            // determine if the two anchors are perpendicular to each other in their orientation.  we swap the control 
+            // points around if so (code could be tightened up)
+            var soo = sourceEndpoint.anchor.getOrientation(sourceEndpoint),
+                too = targetEndpoint.anchor.getOrientation(targetEndpoint),
+                perpendicular = soo[0] != too[0] || soo[1] == too[1],
+                p = [];
+
+            if (!perpendicular) {
+                if (soo[0] === 0) // X
+                    p.push(sourceAnchorPosition[0] < targetAnchorPosition[0] ? point[0] + minorAnchor : point[0] - minorAnchor);
+                else p.push(point[0] - (majorAnchor * soo[0]));
+
+                if (soo[1] === 0) // Y
+                    p.push(sourceAnchorPosition[1] < targetAnchorPosition[1] ? point[1] + minorAnchor : point[1] - minorAnchor);
+                else p.push(point[1] + (majorAnchor * too[1]));
+            } else {
+                if (too[0] === 0) // X
+                    p.push(targetAnchorPosition[0] < sourceAnchorPosition[0] ? point[0] + minorAnchor : point[0] - minorAnchor);
+                else p.push(point[0] + (majorAnchor * too[0]));
+
+                if (too[1] === 0) // Y
+                    p.push(targetAnchorPosition[1] < sourceAnchorPosition[1] ? point[1] + minorAnchor : point[1] - minorAnchor);
+                else p.push(point[1] + (majorAnchor * soo[1]));
+            }
+
+            return p;
+        };
+
+        this._compute = function (paintInfo, p) {
+
+            var sp = p.sourcePos,
+                tp = p.targetPos,
+                _w = Math.abs(sp[0] - tp[0]),
+                _h = Math.abs(sp[1] - tp[1]),
+                _sx = sp[0] < tp[0] ? _w : 0,
+                _sy = sp[1] < tp[1] ? _h : 0,
+                _tx = sp[0] < tp[0] ? 0 : _w,
+                _ty = sp[1] < tp[1] ? 0 : _h,
+                _CP = this._findControlPoint([_sx, _sy], sp, tp, p.sourceEndpoint, p.targetEndpoint, paintInfo.so, paintInfo.to),
+                _CP2 = this._findControlPoint([_tx, _ty], tp, sp, p.targetEndpoint, p.sourceEndpoint, paintInfo.so, paintInfo.to);
+
+            _super.addSegment(this, "Bezier", {
+                x1: _sx,
+                y1: _sy,
+                x2: _tx,
+                y2: _ty,
+                cp1x: _CP[0],
+                cp1y: _CP[1],
+                cp2x: _CP2[0],
+                cp2y: _CP2[1]
+            });
+        };
+    };
+
+    global.jsPlumbUtil.extend(Bezier, global.jsPlumb.Connectors.AbstractConnector);
+    global.jsPlumb.registerConnectorType(Bezier, "Bezier");
+
+})(typeof exports !== undefined ? exports : this);
+/*
+ * jsPlumb
+ *
+ * Title:jsPlumb 1.7.2
+ *
+ * Provides a way to visually connect elements on an HTML page, using SVG or VML.
+ *
+ * This file contains the SVG renderers.
+ *
+ * Copyright (c) 2010 - 2014 Simon Porritt (simon@jsplumbtoolkit.com)
+ *
+ * http://jsplumbtoolkit.com
+ * http://github.com/sporritt/jsplumb
+ *
+ * Dual licensed under the MIT and GPL2 licenses.
+ */
+;
+(function (global) {
+
+    // ************************** SVG utility methods ********************************************	
+
+    "use strict";
+
+    var svgAttributeMap = {
+            "joinstyle": "stroke-linejoin",
+            "stroke-linejoin": "stroke-linejoin",
+            "stroke-dashoffset": "stroke-dashoffset",
+            "stroke-linecap": "stroke-linecap"
+        },
+        STROKE_DASHARRAY = "stroke-dasharray",
+        DASHSTYLE = "dashstyle",
+        LINEAR_GRADIENT = "linearGradient",
+        RADIAL_GRADIENT = "radialGradient",
+        DEFS = "defs",
+        FILL = "fill",
+        STOP = "stop",
+        STROKE = "stroke",
+        STROKE_WIDTH = "stroke-width",
+        STYLE = "style",
+        NONE = "none",
+        JSPLUMB_GRADIENT = "jsplumb_gradient_",
+        LINE_WIDTH = "lineWidth",
+        ns = {
+            svg: "http://www.w3.org/2000/svg",
+            xhtml: "http://www.w3.org/1999/xhtml"
+        },
+        _attr = function (node, attributes) {
+            for (var i in attributes)
+                node.setAttribute(i, "" + attributes[i]);
+        },
+        _node = function (name, attributes) {
+            var n = document.createElementNS(ns.svg, name);
+            attributes = attributes || {};
+            attributes.version = "1.1";
+            attributes.xmlns = ns.xhtml;
+            _attr(n, attributes);
+            return n;
+        },
+        _pos = function (d) {
+            return "position:absolute;left:" + d[0] + "px;top:" + d[1] + "px";
+        },
+        _clearGradient = function (parent) {
+            // TODO use querySelectorAll here instead?
+            for (var i = 0; i < parent.childNodes.length; i++) {
+                if (parent.childNodes[i].tagName == DEFS || parent.childNodes[i].tagName == LINEAR_GRADIENT || parent.childNodes[i].tagName == RADIAL_GRADIENT)
+                    parent.removeChild(parent.childNodes[i]);
+            }
+        },
+        _updateGradient = function (parent, node, style, dimensions, uiComponent) {
+            var id = JSPLUMB_GRADIENT + uiComponent._jsPlumb.instance.idstamp();
+            // first clear out any existing gradient
+            _clearGradient(parent);
+            // this checks for an 'offset' property in the gradient, and in the absence of it, assumes
+            // we want a linear gradient. if it's there, we create a radial gradient.
+            // it is possible that a more explicit means of defining the gradient type would be
+            // better. relying on 'offset' means that we can never have a radial gradient that uses
+            // some default offset, for instance.
+            // issue 244 suggested the 'gradientUnits' attribute; without this, straight/flowchart connectors with gradients would
+            // not show gradients when the line was perfectly horizontal or vertical.
+            var g;
+            if (!style.gradient.offset)
+                g = _node(LINEAR_GRADIENT, {
+                    id: id,
+                    gradientUnits: "userSpaceOnUse"
+                });
+            else
+                g = _node(RADIAL_GRADIENT, {
+                    id: id
+                });
+
+            var defs = _node(DEFS);
+            parent.appendChild(defs);
+            defs.appendChild(g);
+            //parent.appendChild(g);
+
+            // the svg radial gradient seems to treat stops in the reverse 
+            // order to how canvas does it.  so we want to keep all the maths the same, but
+            // iterate the actual style declarations in reverse order, if the x indexes are not in order.
+            for (var i = 0; i < style.gradient.stops.length; i++) {
+                var styleToUse = uiComponent.segment == 1 || uiComponent.segment == 2 ? i : style.gradient.stops.length - 1 - i,
+                    stopColor = global.jsPlumbUtil.convertStyle(style.gradient.stops[styleToUse][1], true),
+                    s = _node(STOP, {
+                        "offset": Math.floor(style.gradient.stops[i][0] * 100) + "%",
+                        "stop-color": stopColor
+                    });
+
+                g.appendChild(s);
+            }
+            var applyGradientTo = style.strokeStyle ? STROKE : FILL;
+            //node.setAttribute(STYLE, applyGradientTo + ":url(" + /[^#]+/.exec(document.location.toString()) + "#" + id + ")");
+            //node.setAttribute(STYLE, applyGradientTo + ":url(#" + id + ")");
+            //node.setAttribute(applyGradientTo,  "url(" + /[^#]+/.exec(document.location.toString()) + "#" + id + ")");
+            node.setAttribute(applyGradientTo, "url(#" + id + ")");
+        },
+        _applyStyles = function (parent, node, style, dimensions, uiComponent) {
+
+            node.setAttribute(FILL, style.fillStyle ? global.jsPlumbUtil.convertStyle(style.fillStyle, true) : NONE);
+            node.setAttribute(STROKE, style.strokeStyle ? global.jsPlumbUtil.convertStyle(style.strokeStyle, true) : NONE);
+
+            if (style.gradient) {
+                _updateGradient(parent, node, style, dimensions, uiComponent);
+            } else {
+                // make sure we clear any existing gradient
+                _clearGradient(parent);
+                node.setAttribute(STYLE, "");
+            }
+
+
+            if (style.lineWidth) {
+                node.setAttribute(STROKE_WIDTH, style.lineWidth);
+            }
+
+            // in SVG there is a stroke-dasharray attribute we can set, and its syntax looks like
+            // the syntax in VML but is actually kind of nasty: values are given in the pixel
+            // coordinate space, whereas in VML they are multiples of the width of the stroked
+            // line, which makes a lot more sense.  for that reason, jsPlumb is supporting both
+            // the native svg 'stroke-dasharray' attribute, and also the 'dashstyle' concept from
+            // VML, which will be the preferred method.  the code below this converts a dashstyle
+            // attribute given in terms of stroke width into a pixel representation, by using the
+            // stroke's lineWidth. 
+            if (style[DASHSTYLE] && style[LINE_WIDTH] && !style[STROKE_DASHARRAY]) {
+                var sep = style[DASHSTYLE].indexOf(",") == -1 ? " " : ",",
+                    parts = style[DASHSTYLE].split(sep),
+                    styleToUse = "";
+                parts.forEach(function (p) {
+                    styleToUse += (Math.floor(p * style.lineWidth) + sep);
+                });
+                node.setAttribute(STROKE_DASHARRAY, styleToUse);
+            } else if (style[STROKE_DASHARRAY]) {
+                node.setAttribute(STROKE_DASHARRAY, style[STROKE_DASHARRAY]);
+            }
+
+            // extra attributes such as join type, dash offset.
+            for (var i in svgAttributeMap) {
+                if (style[i]) {
+                    node.setAttribute(svgAttributeMap[i], style[i]);
+                }
+            }
+        },
+        _decodeFont = function (f) {
+            var r = /([0-9].)(p[xt])\s(.*)/,
+                bits = f.match(r);
+
+            return {
+                size: bits[1] + bits[2],
+                font: bits[3]
+            };
+        },
+        _appendAtIndex = function (svg, path, idx) {
+            if (svg.childNodes.length > idx) {
+                svg.insertBefore(path, svg.childNodes[idx]);
+            } else svg.appendChild(path);
+        };
+
+    /**
+		utility methods for other objects to use.
+	*/
+    global.jsPlumbUtil.svg = {
+        node: _node,
+        attr: _attr,
+        pos: _pos
+    };
+
+    // ************************** / SVG utility methods ********************************************	
+
+    /*
+     * Base class for SVG components.
+     */
+    var SvgComponent = function (params) {
+        var pointerEventsSpec = params.pointerEventsSpec || "all",
+            renderer = {};
+
+        global.jsPlumb.jsPlumbUIComponent.apply(this, params.originalArgs);
+        this.canvas = null;
+        this.path = null;
+        this.svg = null;
+        this.bgCanvas = null;
+
+        var clazz = params.cssClass + " " + (params.originalArgs[0].cssClass || ""),
+            svgParams = {
+                "style": "",
+                "width": 0,
+                "height": 0,
+                "pointer-events": pointerEventsSpec,
+                "position": "absolute"
+            };
+
+        this.svg = _node("svg", svgParams);
+
+        if (params.useDivWrapper) {
+            this.canvas = document.createElement("div");
+            this.canvas.style.position = "absolute";
+            global.jsPlumbUtil.sizeElement(this.canvas, 0, 0, 1, 1);
+            this.canvas.className = clazz;
+        } else {
+            _attr(this.svg, {
+                "class": clazz
+            });
+            this.canvas = this.svg;
+        }
+
+        params._jsPlumb.appendElement(this.canvas, params.originalArgs[0].parent);
+        if (params.useDivWrapper) this.canvas.appendChild(this.svg);
+
+        // TODO this displayElement stuff is common between all components, across all
+        // renderers.  would be best moved to jsPlumbUIComponent.
+        var displayElements = [this.canvas];
+        this.getDisplayElements = function () {
+            return displayElements;
+        };
+
+        this.appendDisplayElement = function (el) {
+            displayElements.push(el);
+        };
+
+        this.paint = function (style, anchor, extents) {
+            if (style !== null) {
+
+                var xy = [this.x, this.y],
+                    wh = [this.w, this.h],
+                    p;
+                if (extents !== null) {
+                    if (extents.xmin < 0) xy[0] += extents.xmin;
+                    if (extents.ymin < 0) xy[1] += extents.ymin;
+                    wh[0] = extents.xmax + ((extents.xmin < 0) ? -extents.xmin : 0);
+                    wh[1] = extents.ymax + ((extents.ymin < 0) ? -extents.ymin : 0);
+                }
+
+                if (params.useDivWrapper) {
+                    global.jsPlumbUtil.sizeElement(this.canvas, xy[0], xy[1], wh[0], wh[1]);
+                    xy[0] = 0;
+                    xy[1] = 0;
+                    p = _pos([0, 0]);
+                } else
+                    p = _pos([xy[0], xy[1]]);
+
+                renderer.paint.apply(this, arguments);
+
+                _attr(this.svg, {
+                    "style": p,
+                    "width": wh[0],
+                    "height": wh[1]
+                });
+            }
+        };
+
+        return {
+            renderer: renderer
+        };
+    };
+
+    global.jsPlumbUtil.extend(SvgComponent, global.jsPlumb.jsPlumbUIComponent, {
+        cleanup: function () {
+            if (this.canvas) this.canvas._jsPlumb = null;
+            if (this.svg) this.svg._jsPlumb = null;
+            if (this.bgCanvas) this.bgCanvas._jsPlumb = null;
+
+            if (this.canvas && this.canvas.parentNode) this.canvas.parentNode.removeChild(this.canvas);
+            if (this.bgCanvas && this.bgCanvas.parentNode) this.canvas.parentNode.removeChild(this.canvas);
+
+            this.svg = null;
+            this.canvas = null;
+            this.path = null;
+            this.group = null;
+        },
+        setVisible: function (v) {
+            if (this.canvas) {
+                this.canvas.style.display = v ? "block" : "none";
+            }
+        }
+    });
+
+    /*
+     * Base class for SVG connectors.
+     */
+    global.jsPlumb.ConnectorRenderers.svg = function (params) {
+        var self = this,
+            _super = SvgComponent.apply(this, [{
+                cssClass: params._jsPlumb.connectorClass,
+                originalArgs: arguments,
+                pointerEventsSpec: "none",
+                _jsPlumb: params._jsPlumb
+   }]);
+
+        /*this.pointOnPath = function(location, absolute) {
+			if (!self.path) return [0,0];
+			var p = absolute ? location : location * self.path.getTotalLength();
+			return self.path.getPointAtLength(p);
+		};*/
+
+        _super.renderer.paint = function (style, anchor, extents) {
+
+            var segments = self.getSegments(),
+                p = "",
+                offset = [0, 0];
+            if (extents.xmin < 0) offset[0] = -extents.xmin;
+            if (extents.ymin < 0) offset[1] = -extents.ymin;
+
+            if (segments.length > 0) {
+
+                // create path from segments.	
+                for (var i = 0; i < segments.length; i++) {
+                    p += global.jsPlumb.Segments.svg.SegmentRenderer.getPath(segments[i]);
+                    p += " ";
+                }
+
+                var a = {
+                        d: p,
+                        transform: "translate(" + offset[0] + "," + offset[1] + ")",
+                        "pointer-events": params["pointer-events"] || "visibleStroke"
+                    },
+                    outlineStyle = null,
+                    d = [self.x, self.y, self.w, self.h];
+
+                // outline style.  actually means drawing an svg object underneath the main one.
+                if (style.outlineColor) {
+                    var outlineWidth = style.outlineWidth || 1,
+                        outlineStrokeWidth = style.lineWidth + (2 * outlineWidth);
+                    outlineStyle = global.jsPlumb.extend({}, style);
+                    delete outlineStyle.gradient;
+                    outlineStyle.strokeStyle = global.jsPlumbUtil.convertStyle(style.outlineColor);
+                    outlineStyle.lineWidth = outlineStrokeWidth;
+
+                    if (self.bgPath === null) {
+                        self.bgPath = _node("path", a);
+                        _appendAtIndex(self.svg, self.bgPath, 0);
+                    } else {
+                        _attr(self.bgPath, a);
+                    }
+
+                    _applyStyles(self.svg, self.bgPath, outlineStyle, d, self);
+                }
+
+                if (self.path === null) {
+                    self.path = _node("path", a);
+                    _appendAtIndex(self.svg, self.path, style.outlineColor ? 1 : 0);
+                } else {
+                    _attr(self.path, a);
+                }
+
+                _applyStyles(self.svg, self.path, style, d, self);
+            }
+        };
+    };
+    global.jsPlumbUtil.extend(global.jsPlumb.ConnectorRenderers.svg, SvgComponent);
+
+    // ******************************* svg segment renderer *****************************************************	
+
+    global.jsPlumb.Segments.svg = {
+        SegmentRenderer: {
+            getPath: function (segment) {
+                return ({
+                    "Straight": function () {
+                        var d = segment.getCoordinates();
+                        return "M " + d.x1 + " " + d.y1 + " L " + d.x2 + " " + d.y2;
+                    },
+                    "Bezier": function () {
+                        var d = segment.params;
+                        return "M " + d.x1 + " " + d.y1 +
+                            " C " + d.cp1x + " " + d.cp1y + " " + d.cp2x + " " + d.cp2y + " " + d.x2 + " " + d.y2;
+                    },
+                    "Arc": function () {
+                        var d = segment.params,
+                            laf = segment.sweep > Math.PI ? 1 : 0,
+                            sf = segment.anticlockwise ? 0 : 1;
+
+                        return "M" + segment.x1 + " " + segment.y1 + " A " + segment.radius + " " + d.r + " 0 " + laf + "," + sf + " " + segment.x2 + " " + segment.y2;
+                    }
+                })[segment.type]();
+            }
+        }
+    };
+
+    // ******************************* /svg segments *****************************************************
+
+    /*
+     * Base class for SVG endpoints.
+     */
+    var SvgEndpoint = global.SvgEndpoint = function (params) {
+        var _super = SvgComponent.apply(this, [{
+            cssClass: params._jsPlumb.endpointClass,
+            originalArgs: arguments,
+            pointerEventsSpec: "all",
+            useDivWrapper: true,
+            _jsPlumb: params._jsPlumb
+   }]);
+
+        _super.renderer.paint = function (style) {
+            var s = global.jsPlumb.extend({}, style);
+            if (s.outlineColor) {
+                s.strokeWidth = s.outlineWidth;
+                s.strokeStyle = global.jsPlumbUtil.convertStyle(s.outlineColor, true);
+            }
+
+            if (this.node === null) {
+                this.node = this.makeNode(s);
+                this.svg.appendChild(this.node);
+            } else if (this.updateNode !== null) {
+                this.updateNode(this.node);
+            }
+            _applyStyles(this.svg, this.node, s, [this.x, this.y, this.w, this.h], this);
+            _pos(this.node, [this.x, this.y]);
+        }.bind(this);
+
+    };
+    global.jsPlumbUtil.extend(SvgEndpoint, SvgComponent);
+
+    /*
+     * SVG Dot Endpoint
+     */
+    global.jsPlumb.Endpoints.svg.Dot = function () {
+        global.jsPlumb.Endpoints.Dot.apply(this, arguments);
+        SvgEndpoint.apply(this, arguments);
+        this.makeNode = function (style) {
+            return _node("circle", {
+                "cx": this.w / 2,
+                "cy": this.h / 2,
+                "r": this.radius
+            });
+        };
+        this.updateNode = function (node) {
+            _attr(node, {
+                "cx": this.w / 2,
+                "cy": this.h / 2,
+                "r": this.radius
+            });
+        };
+    };
+    global.jsPlumbUtil.extend(global.jsPlumb.Endpoints.svg.Dot, [global.jsPlumb.Endpoints.Dot, SvgEndpoint]);
+
+    /*
+     * SVG Rectangle Endpoint
+     */
+    global.jsPlumb.Endpoints.svg.Rectangle = function () {
+        global.jsPlumb.Endpoints.Rectangle.apply(this, arguments);
+        SvgEndpoint.apply(this, arguments);
+        this.makeNode = function (style) {
+            return _node("rect", {
+                "width": this.w,
+                "height": this.h
+            });
+        };
+        this.updateNode = function (node) {
+            _attr(node, {
+                "width": this.w,
+                "height": this.h
+            });
+        };
+    };
+    global.jsPlumbUtil.extend(global.jsPlumb.Endpoints.svg.Rectangle, [global.jsPlumb.Endpoints.Rectangle, SvgEndpoint]);
+
+    /*
+     * SVG Image Endpoint is the default image endpoint.
+     */
+    global.jsPlumb.Endpoints.svg.Image = global.jsPlumb.Endpoints.Image;
+    /*
+     * Blank endpoint in svg renderer is the default Blank endpoint.
+     */
+    global.jsPlumb.Endpoints.svg.Blank = global.jsPlumb.Endpoints.Blank;
+    /*
+     * Label overlay in svg renderer is the default Label overlay.
+     */
+    global.jsPlumb.Overlays.svg.Label = global.jsPlumb.Overlays.Label;
+    /*
+     * Custom overlay in svg renderer is the default Custom overlay.
+     */
+    global.jsPlumb.Overlays.svg.Custom = global.jsPlumb.Overlays.Custom;
+
+    var AbstractSvgArrowOverlay = function (superclass, originalArgs) {
+        superclass.apply(this, originalArgs);
+        global.jsPlumb.jsPlumbUIComponent.apply(this, originalArgs);
+        this.isAppendedAtTopLevel = false;
+        var self = this;
+        this.path = null;
+        this.paint = function (params, containerExtents) {
+            // only draws on connections, not endpoints.
+            if (params.component.svg && containerExtents) {
+                if (this.path === null) {
+                    this.path = _node("path", {
+                        "pointer-events": "all"
+                    });
+                    params.component.svg.appendChild(this.path);
+
+                    this.canvas = params.component.svg; // for the sake of completeness; this behaves the same as other overlays
+                }
+                var clazz = originalArgs && (originalArgs.length == 1) ? (originalArgs[0].cssClass || "") : "",
+                    offset = [0, 0];
+
+                if (containerExtents.xmin < 0) offset[0] = -containerExtents.xmin;
+                if (containerExtents.ymin < 0) offset[1] = -containerExtents.ymin;
+
+                _attr(this.path, {
+                    "d": makePath(params.d),
+                    "class": clazz,
+                    stroke: params.strokeStyle ? params.strokeStyle : null,
+                    fill: params.fillStyle ? params.fillStyle : null,
+                    transform: "translate(" + offset[0] + "," + offset[1] + ")"
+                });
+            }
+        };
+        var makePath = function (d) {
+            return "M" + d.hxy.x + "," + d.hxy.y +
+                " L" + d.tail[0].x + "," + d.tail[0].y +
+                " L" + d.cxy.x + "," + d.cxy.y +
+                " L" + d.tail[1].x + "," + d.tail[1].y +
+                " L" + d.hxy.x + "," + d.hxy.y;
+        };
+    };
+    global.jsPlumbUtil.extend(AbstractSvgArrowOverlay, [global.jsPlumb.jsPlumbUIComponent, global.jsPlumb.Overlays.AbstractOverlay], {
+        cleanup: function () {
+            if (this.path !== null) this._jsPlumb.instance.removeElement(this.path);
+        },
+        setVisible: function (v) {
+            if (this.path !== null)(this.path.style.display = (v ? "block" : "none"));
+        }
+    });
+
+    global.jsPlumb.Overlays.svg.Arrow = function () {
+        AbstractSvgArrowOverlay.apply(this, [global.jsPlumb.Overlays.Arrow, arguments]);
+    };
+    global.jsPlumbUtil.extend(global.jsPlumb.Overlays.svg.Arrow, [global.jsPlumb.Overlays.Arrow, AbstractSvgArrowOverlay]);
+
+    global.jsPlumb.Overlays.svg.PlainArrow = function () {
+        AbstractSvgArrowOverlay.apply(this, [global.jsPlumb.Overlays.PlainArrow, arguments]);
+    };
+    global.jsPlumbUtil.extend(global.jsPlumb.Overlays.svg.PlainArrow, [global.jsPlumb.Overlays.PlainArrow, AbstractSvgArrowOverlay]);
+
+    global.jsPlumb.Overlays.svg.Diamond = function () {
+        AbstractSvgArrowOverlay.apply(this, [global.jsPlumb.Overlays.Diamond, arguments]);
+    };
+    global.jsPlumbUtil.extend(global.jsPlumb.Overlays.svg.Diamond, [global.jsPlumb.Overlays.Diamond, AbstractSvgArrowOverlay]);
+
+    // a test
+    global.jsPlumb.Overlays.svg.GuideLines = function () {
+        var path = null,
+            self = this,
+            p1_1, p1_2;
+        global.jsPlumb.Overlays.GuideLines.apply(this, arguments);
+        this.paint = function (params, containerExtents) {
+            if (path === null) {
+                path = _node("path");
+                params.connector.svg.appendChild(path);
+                self.attachListeners(path, params.connector);
+                self.attachListeners(path, self);
+
+                p1_1 = _node("path");
+                params.connector.svg.appendChild(p1_1);
+                self.attachListeners(p1_1, params.connector);
+                self.attachListeners(p1_1, self);
+
+                p1_2 = _node("path");
+                params.connector.svg.appendChild(p1_2);
+                self.attachListeners(p1_2, params.connector);
+                self.attachListeners(p1_2, self);
+            }
+
+            var offset = [0, 0];
+            if (containerExtents.xmin < 0) offset[0] = -containerExtents.xmin;
+            if (containerExtents.ymin < 0) offset[1] = -containerExtents.ymin;
+
+            _attr(path, {
+                "d": makePath(params.head, params.tail),
+                stroke: "red",
+                fill: null,
+                transform: "translate(" + offset[0] + "," + offset[1] + ")"
+            });
+
+            _attr(p1_1, {
+                "d": makePath(params.tailLine[0], params.tailLine[1]),
+                stroke: "blue",
+                fill: null,
+                transform: "translate(" + offset[0] + "," + offset[1] + ")"
+            });
+
+            _attr(p1_2, {
+                "d": makePath(params.headLine[0], params.headLine[1]),
+                stroke: "green",
+                fill: null,
+                transform: "translate(" + offset[0] + "," + offset[1] + ")"
+            });
+        };
+
+        var makePath = function (d1, d2) {
+            return "M " + d1.x + "," + d1.y +
+                " L" + d2.x + "," + d2.y;
+        };
+    };
+    global.jsPlumbUtil.extend(global.jsPlumb.Overlays.svg.GuideLines, global.jsPlumb.Overlays.GuideLines);
 })(typeof exports !== undefined ? exports : this);
