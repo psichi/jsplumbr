@@ -1,2 +1,2 @@
-var jsPlumb = require('./src/bundle.js');
+var jsPlumb = require('./index.js');
 console.log(jsPlumb);

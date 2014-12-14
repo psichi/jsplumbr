@@ -1,8 +1,9 @@
 #!/bin/sh
 
-cd jsPlumb/src/
+mkdir -p build/
+cp jsPlumb/src/*.js build/
 
-git reset HEAD --hard
+cd build
 
 replace ';\(function\(\) {' ';(function(global) {' *.js
 replace '^}\)\(\);' '})(typeof exports !== 'undefined' ? exports : this);'
@@ -36,6 +37,6 @@ cat \
   endpoint.js connection.js \
   anchors.js defaults.js \
   base-library-adapter.js \
-  > ../../index.js
+  > ../index.js
 
-cd ../../
+cd ../
