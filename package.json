@@ -1,7 +1,7 @@
 {
   "name": "jsPlumbr",
-  "version": "1.0.0",
-  "description": "",
+  "version": "1.7.2",
+  "description": "require JSPlumb",
   "main": "index.js",
   "scripts": {
     "build": "./build.sh"
@@ -9,6 +9,7 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
+    "js-beautify": "^1.5.4",
     "replace": "^0.3.0"
   }
 }
